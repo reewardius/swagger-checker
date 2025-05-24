@@ -18,7 +18,7 @@ This script extracts the URL (https://...) from each line and processes it.
 #### ▶️ How to Use
 Run the Python script:
 ```
-python3 swagger_check.py
+python3 swagger_new.py
 ```
 #### 📄 Output
 All working GET endpoints (status code 200) are saved in `swagger_get_200.txt`.
