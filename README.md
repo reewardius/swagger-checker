@@ -28,9 +28,12 @@ All working GET endpoints (status code 200) are saved in `swagger_get_200.txt`.
 
 ##### Check JSON/PLAIN Content-Type
 
-````
-python check.py
-````
+```
+python check-content-type.py -f swagger_get_200.txt -o content-types-results.txt
+
+[OK] https://target.com/api/v1/check --> application/json; charset=utf-8
+[OK] https://example.com/api/v2/status --> application/json; charset=utf-8
+```
 
 ##### Swagger + Trufflehog
 ```
