@@ -19,24 +19,48 @@ def get_base_from_url(swagger_url):
 def extract_swagger_from_js(js_content):
     """Извлекает Swagger спецификацию из JavaScript кода"""
     try:
-        # Ищем объект swaggerDoc с кавычками
-        pattern = r'"swaggerDoc":\s*({.*?})\s*[,}]'
-        match = re.search(pattern, js_content, re.DOTALL)
+        # Ищем начало swaggerDoc
+        start_marker = '"swaggerDoc":'
+        start_idx = js_content.find(start_marker) + len(start_marker)
         
-        if match:
-            swagger_json_str = match.group(1)
-            swagger_data = json.loads(swagger_json_str)
-            return swagger_data
-            
-        # Альтернативный поиск без кавычек
-        pattern = r'swaggerDoc:\s*({.*?})\s*[,}]'
-        match = re.search(pattern, js_content, re.DOTALL)
+        if start_idx == len(start_marker) - 1:  # find вернул -1
+            print("[DEBUG] Не удалось найти swaggerDoc в JS")
+            return None
         
-        if match:
-            swagger_json_str = match.group(1)
-            swagger_data = json.loads(swagger_json_str)
-            return swagger_data
+        # Пропускаем пробелы
+        while start_idx < len(js_content) and js_content[start_idx].isspace():
+            start_idx += 1
+        
+        # Проверяем, что начинается объект
+        if js_content[start_idx] != '{':
+            print("[DEBUG] Ожидался объект после swaggerDoc")
+            return None
+        
+        # Парсим объект, учитывая вложенные скобки
+        brace_count = 1
+        end_idx = start_idx + 1
+        
+        while end_idx < len(js_content) and brace_count > 0:
+            if js_content[end_idx] == '{':
+                brace_count += 1
+            elif js_content[end_idx] == '}':
+                brace_count -= 1
+            end_idx += 1
+        
+        if brace_count != 0:
+            print("[DEBUG] Неправильная структура объекта swaggerDoc (несбалансированные скобки)")
+            return None
+        
+        # Извлекаем строку JSON
+        swagger_json_str = js_content[start_idx:end_idx].strip()
+        
+        # Парсим JSON
+        swagger_data = json.loads(swagger_json_str)
+        return swagger_data
             
+    except json.JSONDecodeError as e:
+        print(f"[DEBUG] Ошибка парсинга JSON: {e}")
+        print(f"[DEBUG] Извлечённая строка (первые 500 символов): {swagger_json_str[:500]}...")
     except Exception as e:
         print(f"[DEBUG] Ошибка парсинга JS: {e}")
         
@@ -59,7 +83,8 @@ def generate_swagger_urls(swagger_ui_url):
         f"{base_url}/api-docs",
         f"{base_url}/swagger/doc.json",
         f"{base_url}/api/swagger.json",
-        f"{base_url}/openapi.json"
+        f"{base_url}/openapi.json",
+        f"{base_url}/swagger/developer/swagger.json"
     ])
     
     # Стандартные JS пути
@@ -70,7 +95,6 @@ def generate_swagger_urls(swagger_ui_url):
     ])
     
     # Анализ конкретного пути для генерации специфичных вариантов
-    
     if path.endswith("/swagger-ui.js"):
         # Банковские API часто используют этот путь
         json_urls.extend([
