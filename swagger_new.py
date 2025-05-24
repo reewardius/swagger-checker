@@ -156,7 +156,7 @@ def generate_id_variants(url):
     id_pattern = r'\{[^}]*[iI][dD][^}]*\}'
     variants = []
     
-    for id_value in [1, 2, 3]:
+    for id_value in [1, 2, 3, "me","current","admin"]:
         variant_url = re.sub(id_pattern, str(id_value), url)
         variants.append(variant_url)
     
