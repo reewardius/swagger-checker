@@ -22,3 +22,17 @@ python3 swagger_new.py
 ```
 #### 📄 Output
 All working GET endpoints (status code 200) are saved in `swagger_get_200.txt`.
+
+---
+#### Bugbountytips
+
+##### Check JSON/PLAIN Content-Type
+
+````
+python check.py
+````
+
+##### Swagger + Trufflehog
+```
+rm -rf responses/ && httpx -l swagger_get_200.txt -sr -srd responses/ && trufflehog filesystem responses/ > trufflehog_results.txt
+```
