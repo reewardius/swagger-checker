@@ -10,14 +10,14 @@ This tool extracts Swagger/OpenAPI endpoints from a list of known HTTP services,
 
 #### 📂 Input Files
 Output file from nuclei:
-```
+```bash
 nuclei -l alive_http_services.txt -tags swagger,openapi -o swagger_endpoints.txt
 ```
 This script extracts the URL (https://...) from each line and processes it.
 
 #### ▶️ How to Use
 Run the Python script:
-```
+```bash
 python3 swagger_new.py
 
 [RESULT] Найдено 39 валидных GET эндпоинтов с JSON ответом
@@ -34,7 +34,7 @@ All working GET endpoints (status code 200) are saved in `swagger_get_200.txt`.
 
 ##### Check JSON/PLAIN Content-Type
 
-```
+```bash
 python check-content-type.py -f swagger_get_200.txt -o content-types-results.txt
 
 [OK] https://target.com/api/v1/check --> application/json; charset=utf-8
@@ -42,6 +42,6 @@ python check-content-type.py -f swagger_get_200.txt -o content-types-results.txt
 ```
 
 ##### Swagger + Trufflehog
-```
+```bash
 rm -rf responses/ && httpx -l swagger_get_200.txt -sr -srd responses/ && trufflehog filesystem responses/ > trufflehog_results.txt
 ```
