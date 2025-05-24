@@ -19,6 +19,12 @@ This script extracts the URL (https://...) from each line and processes it.
 Run the Python script:
 ```
 python3 swagger_new.py
+
+[RESULT] Найдено 39 валидных GET эндпоинтов с JSON ответом
+
+[DONE] Результаты сохранены в swagger_get_200.txt
+[STATS] Обработано: 1733 эндпоинтов
+[STATS] Валидных: 39 GET эндпоинтов
 ```
 #### 📄 Output
 All working GET endpoints (status code 200) are saved in `swagger_get_200.txt`.
