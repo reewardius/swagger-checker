@@ -13,7 +13,6 @@ Output file from nuclei:
 ```bash
 nuclei -l alive_http_services.txt -tags swagger,openapi -o swagger_endpoints.txt
 ```
-This script extracts the URL (https://...) from each line and processes it.
 
 #### ▶️ How to Use
 Run the Python script:
