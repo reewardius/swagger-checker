@@ -2,14 +2,14 @@
 
 This tool extracts Swagger/OpenAPI endpoints from a list of known HTTP services, parses the documentation to find available API paths, and checks GET endpoints for 200 OK status responses.
 
-#### 🚀 Features
+##### 🚀 Features
 - Supports .js, .json, and .html Swagger UI/OpenAPI links
 - Automatically detects real Swagger JSON URLs
 - Extracts and tests GET endpoints
 - Saves reachable GET endpoints (status 200) into an output file
 
-#### 📂 Input Files
-To ensure `swagger_new.py` works properly, you must first run nuclei with the swagger and openapi tags. Here's an example pipeline to generate the required input:
+##### 📂 Input Files
+To ensure `swagger_new.py` works properly, you must first run `nuclei` with the **swagger and openapi tags**. Here's an example pipeline to generate the required input:
 ```bash
 subfinder -dL root.txt -all -silent -o subs.txt && \
 naabu -l subs.txt -s s -tp 100 -ec -c 50 -o naabu.txt && \
@@ -18,7 +18,7 @@ python3 generate.py -i alive_http_services.txt -o alive_http_services_advanced.t
 nuclei -l alive_http_services_advanced.txt -tags swagger,openapi -o swagger_endpoints.txt -rl 1000 -c 100
 ```
 
-#### ▶️ How to Use
+##### ▶️ How to Use Swagger Checker
 Once `nuclei` has been executed and the `swagger_endpoints.txt` file has been generated, run the Python script:
 ```bash
 python3 swagger_new.py
@@ -29,7 +29,7 @@ python3 swagger_new.py
 [STATS] Обработано: 1733 эндпоинтов
 [STATS] Валидных: 39 GET эндпоинтов
 ```
-#### 📄 Output
+##### 📄 Output
 All working GET endpoints (status code 200) are saved in `swagger_get_200.txt`.
 
 ---
