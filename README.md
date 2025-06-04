@@ -14,7 +14,8 @@ Output file from nuclei:
 subfinder -dL root.txt -all -silent -o subs.txt && \
 naabu -l subs.txt -s s -tp 100 -ec -c 50 -o naabu.txt && \
 httpx -l naabu.txt -rl 500 -t 200 -o alive_http_services.txt && \
-nuclei -l alive_http_services.txt -tags swagger,openapi -o swagger_endpoints.txt -rl 1000 -c 100
+python3 generate.py && \
+nuclei -l alive_http_services_advanced.txt -tags swagger,openapi -o swagger_endpoints.txt -rl 1000 -c 100
 ```
 
 #### ▶️ How to Use
