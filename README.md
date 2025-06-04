@@ -48,3 +48,7 @@ python check-content-type.py -f swagger_get_200.txt -o content-types-results.txt
 ```bash
 rm -rf responses/ && httpx -l swagger_get_200.txt -sr -srd responses/ && trufflehog filesystem responses/ > trufflehog_results.txt
 ```
+##### Trufflehog Only Verified
+```bash
+rm -rf responses/ && httpx -l swagger_get_200.txt -sr -srd responses/ && trufflehog filesystem responses/ --only-verified > trufflehog_verified_results.txt
+```
