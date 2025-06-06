@@ -21,13 +21,14 @@ nuclei -l alive_http_services_advanced.txt -id openapi,swagger-api -o swagger_en
 ##### ▶️ How to Use Swagger Checker
 Once `nuclei` has been executed and the `swagger_endpoints.txt` file has been generated, run the Python script:
 ```bash
-python3 swagger_new.py
+python3 swagger_checker_threads.py -t 100
 
-[RESULT] Найдено 39 валидных GET эндпоинтов с JSON ответом
+[RESULT] Найдено 59 валидных GET эндпоинтов с JSON ответом
 
 [DONE] Результаты сохранены в swagger_get_200.txt
-[STATS] Обработано: 1733 эндпоинтов
-[STATS] Валидных: 39 GET эндпоинтов
+[STATS] Обработано: 1866 эндпоинтов
+[STATS] Валидных: 59 GET эндпоинтов
+[STATS] Использовано потоков: 100
 ```
 ##### 📄 Output
 All working GET endpoints (status code 200) are saved in `swagger_get_200.txt`.
