@@ -45,6 +45,29 @@ python check-content-type.py -f swagger_get_200.txt -o content-types-results.txt
 [OK] https://example.com/api/v2/status --> application/json; charset=utf-8
 ```
 
+##### IP + Ports
+
+```
+subfinder -d <domain> -all -silent -o subs.txt && \
+dnsx -l subs.txt -a -ro -o dnsx.txt && \
+naabu -l dnsx.txt -ec -tp 100 -s s -o ports.txt && \
+httpx -l ports.txt -o alive_http_services.txt && \
+nuclei -l alive_http_services.txt -id openapi,swagger-api -o swagger_endpoints.txt -rl 1000 -c 100 && \
+python3 swagger_checker_threads.py -t 100
+```
+
+##### PTR Records
+
+```
+subfinder -d <domain> -all -silent -o subs.txt && \
+dnsx -l subs.txt -a -ro -o dnsx.txt && \
+dnsx -l dnsx.txt -ptr -ro > dnsx_ptr.txt && \
+naabu -l dnsx_ptr.txt -ec -tp 100 -s s -o ports.txt && \
+httpx -l ports.txt -o alive_http_services.txt && \
+nuclei -l alive_http_services.txt -id openapi,swagger-api -o swagger_endpoints.txt -rl 1000 -c 100 && \
+python3 swagger_checker_threads.py -t 100
+```
+
 ##### Swagger + Trufflehog
 ```bash
 rm -rf responses/ && httpx -l swagger_get_200.txt -sr -srd responses/ && trufflehog filesystem responses/ > trufflehog_results.txt
