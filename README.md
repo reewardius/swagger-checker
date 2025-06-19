@@ -47,7 +47,7 @@ python check-content-type.py -f swagger_get_200.txt -o content-types-results.txt
 
 ##### IP + Ports
 
-```
+```bash
 subfinder -d <domain> -all -silent -o subs.txt && \
 dnsx -l subs.txt -a -ro -o dnsx.txt && \
 naabu -l dnsx.txt -ec -tp 100 -s s -o ports.txt && \
@@ -58,7 +58,7 @@ python3 swagger_checker_threads.py -t 100
 
 ##### PTR Records
 
-```
+```bash
 subfinder -d <domain> -all -silent -o subs.txt && \
 dnsx -l subs.txt -a -ro -o dnsx.txt && \
 dnsx -l dnsx.txt -ptr -ro > dnsx_ptr.txt && \
