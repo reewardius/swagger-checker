@@ -9,7 +9,7 @@ This tool extracts Swagger/OpenAPI endpoints from a list of known HTTP services,
 - Saves reachable GET endpoints (status 200) into an output file
 
 ##### 📂 Input Files
-To ensure `swagger_new.py` works properly, you must first run `nuclei` with the **swagger and openapi tags**. Here's an example pipeline to generate the required input:
+To ensure `swagger_checker_threads.py` works properly, you must first run `nuclei` with the **swagger and openapi tags**. Here's an example pipeline to generate the required input:
 ```bash
 subfinder -dL root.txt -all -silent -o subs.txt && \
 naabu -l subs.txt -s s -tp 100 -ec -c 50 -o naabu.txt && \
