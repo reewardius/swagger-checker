@@ -15,7 +15,7 @@ subfinder -dL root.txt -all -silent -o subs.txt && \
 naabu -l subs.txt -s s -tp 100 -ec -c 50 -o naabu.txt && \
 httpx -l naabu.txt -rl 500 -t 200 -o alive_http_services.txt && \
 python3 generate.py -i alive_http_services.txt -o alive_http_services_advanced.txt && \
-nuclei -l alive_http_services_advanced.txt -id openapi,swagger-api -o swagger_endpoints.txt -rl 1000 -c 100
+nuclei -l alive_http_services_advanced.txt -t swagger.yaml -o swagger_endpoints.txt -rl 1000 -c 100
 ```
 
 ##### ▶️ How to Use Swagger Checker
