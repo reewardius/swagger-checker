@@ -33,13 +33,27 @@ python3 swagger_checker_threads.py -t 100
 ##### 📄 Output
 All working GET endpoints (status code 200) are saved in `swagger_get_200.txt`.
 
+---
 ### Graphql Endpoints Checker
 ```
 python3 graphql_checker_v3.py -d https://target.com/graphql -t 10
 python3 graphql_checker_v3.py -f graphql_targets.txt -t 10
 ```
+**Results Log**
+```
+...
+[SUCCESS] https://target.com/graphql :: time
+[SUCCESS] https://target.com/graphql :: animals
+[SUCCESS] https://target.com/graphql :: habits
+[SUCCESS] https://target.com/graphql :: campaigns(filialIds: "1")
+[SUCCESS] https://target.com/graphql :: certList
+[SUCCESS] https://target.coma/graphql :: offices
+[SUCCESS] https://target.com/graphql :: cities(serviceIds: "1", marketStatusIds: "1")
+...
+```
 
-
+##### 📄 Output
+All working PoCs are saved in `graphql_results/`.
 
 ---
 #### Bugbountytips
