@@ -1,4 +1,4 @@
-## 🧪 Swagger/OpenAPI Endpoint Checker
+## 🧪 Swagger/OpenAPI/GraphQL Endpoint Checker
 
 This tool extracts Swagger/OpenAPI endpoints from a list of known HTTP services, parses the documentation to find available API paths, and checks GET endpoints for 200 OK status responses.
 
@@ -32,6 +32,14 @@ python3 swagger_checker_threads.py -t 100
 ```
 ##### 📄 Output
 All working GET endpoints (status code 200) are saved in `swagger_get_200.txt`.
+
+### Graphql Endpoints Checker
+```
+python3 graphql_checker_v3.py -d https://target.com/graphql -t 10
+python3 graphql_checker_v3.py -f graphql_targets.txt -t 10
+```
+
+
 
 ---
 #### Bugbountytips
@@ -68,11 +76,16 @@ nuclei -l alive_http_services.txt -id openapi,swagger-api -o swagger_endpoints.t
 python3 swagger_checker_threads.py -t 100
 ```
 
-##### Swagger + Trufflehog
+##### Swagger/OpenAPI
 ```bash
-rm -rf responses/ && httpx -l swagger_get_200.txt -sr -srd responses/ && trufflehog filesystem responses/ > trufflehog_results.txt
+rm -rf responses/ && httpx -l swagger_get_200.txt -sr -srd responses/ && trufflehog filesystem responses/ > trufflehog_swagger_results.txt
 ```
 ##### Trufflehog Only Verified
 ```bash
-rm -rf responses/ && httpx -l swagger_get_200.txt -sr -srd responses/ && trufflehog filesystem responses/ --only-verified > trufflehog_verified_results.txt
+rm -rf responses/ && httpx -l swagger_get_200.txt -sr -srd responses/ && trufflehog filesystem responses/ --only-verified > trufflehog_verified_swagger_results.txt
+```
+
+##### GraphQL + Trufflehog
+```
+trufflehog filesystem graphql_results/ --only-verified > trufflehog_verified_graphql_results.txt
 ```
