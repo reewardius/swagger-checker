@@ -36,8 +36,8 @@ All working GET endpoints (status code 200) are saved in `swagger_get_200.txt`.
 ---
 ### Graphql Endpoints Checker
 ```
-python3 graphql_checker_v3.py -d https://target.com/graphql -t 10
-python3 graphql_checker_v3.py -f graphql_targets.txt -t 10
+python3 graphql_checker_v4.py -d https://target.com/graphql -t 10 -m both
+python3 graphql_checker_v4.py -f graphql_targets.txt -t 10 -m both
 ```
 **Results Log**
 ```
