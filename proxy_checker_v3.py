@@ -102,7 +102,13 @@ def build_test_payload(arg, types):
                 else:
                     return 1
             return "test"
-    
+
+    elif kind == "INPUT_OBJECT":
+        input_type = next((x for x in types if x["name"] == name), None)
+        if input_type and input_type.get("fields"):
+            return {f["name"]: build_test_payload(f, types) for f in input_type["fields"]}
+        return {}
+
     elif name == "Int" or (name and "int" in name.lower()):
         return 1
     elif name == "Float" or (name and "float" in name.lower()):
@@ -125,6 +131,7 @@ def build_test_payload(arg, types):
             elif any(keyword in arg_name for keyword in ['id', 'number', 'num', 'count', 'index', 'position', 'order']):
                 return 123
         return "test"
+
 
 def build_field_selection(field, types, depth=0, max_depth=5):
     if depth > max_depth:
@@ -150,22 +157,25 @@ def serialize_arg_value(value):
     if isinstance(value, dict):
         items = []
         for k, v in value.items():
-            if isinstance(v, str):
+            if isinstance(v, str) and not re.match(r'^[A-Z0-9_]+$', v):  # строки, кроме ENUM
                 items.append(f'{k}: "{v}"')
             else:
-                items.append(f'{k}: {json.dumps(v)}')
+                items.append(f'{k}: {serialize_arg_value(v)}')
         return "{" + ", ".join(items) + "}"
     elif isinstance(value, list):
         serialized_items = []
         for item in value:
             if isinstance(item, dict):
                 serialized_items.append(serialize_arg_value(item))
-            elif isinstance(item, str):
+            elif isinstance(item, str) and not re.match(r'^[A-Z0-9_]+$', item):
                 serialized_items.append(f'"{item}"')
             else:
                 serialized_items.append(str(item))
         return "[" + ", ".join(serialized_items) + "]"
     elif isinstance(value, str):
+        # если это ENUM (например NOT_ACTIVATED), не экранируем
+        if re.match(r'^[A-Z0-9_]+$', value):
+            return value
         return f'"{value}"'
     else:
         return str(value).lower() if isinstance(value, bool) else str(value)
