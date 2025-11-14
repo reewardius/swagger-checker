@@ -12,7 +12,8 @@ This tool extracts Swagger/OpenAPI endpoints from a list of known HTTP services,
 To ensure `swagger_checker_threads.py` works properly, you must first run `nuclei` with the **swagger and openapi tags**. Here's an example pipeline to generate the required input:
 ```bash
 subfinder -dL root.txt -all -silent -o subs.txt && \
-naabu -l subs.txt -s s -tp 100 -ec -c 50 -o naabu.txt && \
+dnsx -l subs.txt -o dnsx.txt && \
+naabu -l dnsx.txt -s s -tp 100 -ec -c 50 -o naabu.txt && \
 httpx -l naabu.txt -rl 500 -t 200 -o alive_http_services.txt && \
 python3 generate.py -i alive_http_services.txt -o alive_http_services_advanced.txt && \
 nuclei -l alive_http_services_advanced.txt -t swagger.yaml -o swagger_endpoints.txt -rl 1000 -c 100
