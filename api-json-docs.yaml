@@ -1,0 +1,74 @@
+id: api-json-docs
+
+info:
+  name: Public API Docs - Detect
+  author: pdteam,c-sh0,AmirHossein Raeisi
+  severity: info
+  description: Public Swagger API was detected.
+  reference: https://swagger.io/
+  classification:
+    cvss-metrics: CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N
+    cwe-id: CWE-200
+  metadata:
+    verified: true
+    max-request: 59
+    shodan-query: "http.title:\"swagger\""
+  tags: exposure,api,swagger
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}{{paths}}"
+
+    payloads:
+      paths:
+        - "/api-docs/swagger.json"
+        - "/swagger.json"
+        - "/swagger/v1/swagger.json"
+        - "/swagger/v2/swagger.json"
+        - "/swagger/v3/swagger.json"
+        - "/api/swagger.json"
+        - "/api/api-docs/swagger.json""
+        - "/api/swagger-ui/swagger.json"
+        - "/api/apidocs/swagger.json"
+        - "/api/spec/swagger.json"
+        - "/api/v1/swagger.json"
+        - "/api/v2/swagger.json"
+        - "/api/v3/swagger.json"
+        - "/api/v1/swagger-ui/swagger.json"
+        - "/api/v2/swagger-ui/swagger.json"
+        - "/api/v3/swagger-ui/swagger.json"
+        - "/api/swagger_doc.json"
+        - "/openapi.json"
+        - "/api/openapi.json"
+        - "/api/v1/openapi.json"
+        - "/api/v2/openapi.json"
+        - "/api/v3/openapi.json"
+        
+    headers:
+      Accept: text/html
+      
+    stop-at-first-match: true
+    matchers-condition: and
+    matchers:
+      - type: word
+        words:
+          - "swagger:"
+          - "Swagger 2.0"
+          - "\"swagger\":"
+          - "Swagger UI"
+          - "loadSwaggerUI"
+          - "**token**:"
+          - "id=\"swagger-ui"
+        condition: or
+
+      - type: status
+        status:
+          - 200
+
+    extractors:
+      - type: regex
+        part: body
+        group: 1
+        regex:
+          - " @version (v[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3})"
