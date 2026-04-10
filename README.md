@@ -56,6 +56,14 @@ python3 graphql_checker_v4.py -f graphql_targets.txt -t 10 -m both
 ##### 📄 Output
 All working PoCs are saved in `graphql_results/`.
 
+### JS API Hunter
+```
+python api_hunter.py -i alive_http_services.txt
+python api_hunter.py -i alive_http_services.txt -o api_200_get.txt -t 20
+```
+
+
+
 ---
 #### Bugbountytips
 
