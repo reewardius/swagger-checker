@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 api_hunter.py — Extract and probe API endpoints from JS files on websites.
+               Sends results via AWS SES with the output file as an attachment.
 
 Usage:
     python api_hunter.py -u https://example.com
@@ -8,6 +9,13 @@ Usage:
     python api_hunter.py -i targets.txt
     python api_hunter.py -i foo.txt -i bar.txt
     python api_hunter.py -u https://example.com -o results.txt -t 20 --timeout 10
+
+    # With email notification:
+    python api_hunter.py -u https://example.com \\
+        --email-sender sender@example.com \\
+        --email-recipient recipient@example.com \\
+        --github-token ghp_... \\
+        --aws-region eu-central-1
 """
 
 import argparse
@@ -15,9 +23,15 @@ import asyncio
 import re
 import subprocess
 import sys
+import os
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
+from datetime import datetime
 
 import aiohttp
 
@@ -145,7 +159,8 @@ async def process_js_urls(
     timeout: int,
     output_file: str,
     methods: List[str],
-):
+) -> int:
+    """Process JS URLs, probe endpoints and write results. Returns count of confirmed endpoints."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -184,7 +199,7 @@ async def process_js_urls(
         print(f"\n[*] Unique endpoints to probe: {len(endpoint_map)}")
         if not endpoint_map:
             print("[!] No API endpoints found.")
-            return
+            return 0
 
         # Step 3: probe endpoints
         print(f"[*] Probing with methods: {methods} (concurrency={concurrency})\n")
@@ -214,6 +229,91 @@ async def process_js_urls(
         print(f"\n[✓] {len(confirmed)} confirmed endpoint(s) appended → {out.resolve()}")
     else:
         print("\n[-] No live endpoints found for this target.")
+
+    return len(confirmed)
+
+
+# ── Email / SES ────────────────────────────────────────────────────────────────
+
+def send_email(
+    subject: str,
+    body_text: str,
+    sender: str,
+    recipient: str,
+    aws_region: str,
+    attachment_path: Optional[str] = None,
+) -> bool:
+    """Send email via AWS SES, optionally with a file attachment."""
+    try:
+        import boto3
+    except ImportError:
+        print("[!] boto3 not installed. Run: pip install boto3")
+        return False
+
+    try:
+        ses_client = boto3.client("ses", region_name=aws_region)
+
+        msg = MIMEMultipart()
+        msg["From"] = sender
+        msg["To"] = recipient
+        msg["Subject"] = subject
+
+        msg.attach(MIMEText(body_text, "plain", "utf-8"))
+
+        # Attach results file if it exists and has content
+        if attachment_path:
+            attach_path = Path(attachment_path)
+            if attach_path.exists() and attach_path.stat().st_size > 0:
+                with attach_path.open("rb") as f:
+                    part = MIMEBase("application", "octet-stream")
+                    part.set_payload(f.read())
+                encoders.encode_base64(part)
+                part.add_header(
+                    "Content-Disposition",
+                    f'attachment; filename="{attach_path.name}"',
+                )
+                msg.attach(part)
+                print(f"[*] Attaching results file: {attach_path.name} "
+                      f"({attach_path.stat().st_size} bytes)")
+            else:
+                print(f"[!] Attachment skipped: file not found or empty ({attachment_path})")
+
+        response = ses_client.send_raw_email(
+            Source=sender,
+            Destinations=[recipient],
+            RawMessage={"Data": msg.as_string()},
+        )
+        print(f"\n✅ Email sent! MessageId: {response['MessageId']}")
+        return True
+
+    except Exception as e:
+        print(f"\n❌ Error sending email: {e}")
+        return False
+
+
+def build_email_body(
+    targets: List[str],
+    total_confirmed: int,
+    output_file: str,
+    duration: float,
+    timestamp: str,
+) -> Tuple[str, str]:
+    """Build email subject and body. Returns (subject, body)."""
+    subject = (
+        f"API Hunter — {total_confirmed} endpoint(s) found"
+        if total_confirmed > 0
+        else "API Hunter — No endpoints found"
+    )
+
+    body = f"API Hunter scan complete.\n"
+    body += f"Confirmed live endpoints: {total_confirmed}\n"
+
+    if total_confirmed > 0:
+        body += "The full results file is attached to this email.\n"
+    else:
+        body += "No live API endpoints were found during this scan.\n"
+
+    return subject, body
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -248,6 +348,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Discover and probe API endpoints found in JS files."
     )
+    # ── Scan options ──────────────────────────────────────────────────────────
     parser.add_argument("-u", "--url", action="append", dest="urls",
                         metavar="URL", help="Target URL (repeatable)")
     parser.add_argument("-i", "--input", action="append", dest="inputs",
@@ -261,11 +362,28 @@ def main():
     parser.add_argument("--methods", default="GET",
                         help="Comma-separated HTTP methods to try, e.g. GET,POST (default: GET)")
 
+    # ── Email / SES options ───────────────────────────────────────────────────
+    email_group = parser.add_argument_group(
+        "email",
+        "Optional: send results via AWS SES after scan completes"
+    )
+    email_group.add_argument("--email-sender", metavar="EMAIL",
+                             help="Sender email address (must be verified in SES)")
+    email_group.add_argument("--email-recipient", metavar="EMAIL",
+                             help="Recipient email address")
+    email_group.add_argument("--aws-region", default="eu-central-1",
+                             help="AWS region for SES (default: eu-central-1)")
+
     args = parser.parse_args()
 
     if not args.urls and not args.inputs:
         parser.print_help()
         sys.exit(1)
+
+    # Validate email args: either both provided or neither
+    email_enabled = bool(args.email_sender or args.email_recipient)
+    if email_enabled and not (args.email_sender and args.email_recipient):
+        parser.error("--email-sender and --email-recipient must both be provided.")
 
     methods = [m.strip().upper() for m in args.methods.split(",") if m.strip()]
 
@@ -280,6 +398,10 @@ def main():
     print(f"[*] Output file cleared: {out_path.resolve()}")
     print(f"[*] {len(targets)} target(s) to process")
 
+    start_time = datetime.now()
+    timestamp = start_time.strftime("%Y-%m-%d %H:%M:%S")
+    total_confirmed = 0
+
     for i, target in enumerate(targets, 1):
         print(f"\n{'='*60}")
         print(f"[{i}/{len(targets)}] {target}")
@@ -293,15 +415,37 @@ def main():
             print("[!] No JS files found, skipping.")
             continue
 
-        asyncio.run(process_js_urls(
+        count = asyncio.run(process_js_urls(
             js_urls=js_urls,
             concurrency=args.threads,
             timeout=args.timeout,
             output_file=args.output,
             methods=methods,
         ))
+        total_confirmed += count
 
+    duration = (datetime.now() - start_time).total_seconds()
     print(f"\n[*] Done. Results in: {out_path.resolve()}")
+    print(f"[*] Total confirmed endpoints: {total_confirmed} | Duration: {duration:.1f}s")
+
+    # ── Send email if configured ──────────────────────────────────────────────
+    if email_enabled:
+        print(f"\n[*] Sending email report to {args.email_recipient}…")
+        subject, body = build_email_body(
+            targets=targets,
+            total_confirmed=total_confirmed,
+            output_file=str(out_path.resolve()),
+            duration=duration,
+            timestamp=timestamp,
+        )
+        send_email(
+            subject=subject,
+            body_text=body,
+            sender=args.email_sender,
+            recipient=args.email_recipient,
+            aws_region=args.aws_region,
+            attachment_path=args.output,
+        )
 
 
 if __name__ == "__main__":
