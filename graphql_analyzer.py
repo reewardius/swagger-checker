@@ -49,11 +49,13 @@ def build_headers(args):
     return headers
 
 # === Folder helpers ===
+def sanitize_url(url):
+    return re.sub(r'[:/\.]+', '_', url)
+
 def prepare_results_folder(results_dir, mode, url):
-    sanitized_url = re.sub(r'[:/\.]+', '_', url)
-    mode_dir = os.path.join(results_dir, mode, sanitized_url)
-    os.makedirs(mode_dir, exist_ok=True)
-    return mode_dir
+    url_dir = os.path.join(results_dir, sanitize_url(url), mode)
+    os.makedirs(url_dir, exist_ok=True)
+    return url_dir
 
 # === GraphQL helpers ===
 def post_graphql(url, query, headers, timeout=10):
@@ -639,8 +641,8 @@ def main():
             alias_findings = check_aliases(url, headers, args.output,
                                            schema=schema, alias_count=args.alias_count)
 
-        # Report per URL
-        url_output = os.path.join(args.output, re.sub(r'[:/\.]+', '_', url))
+        # Report per URL — sits in the root of the target folder
+        url_output = os.path.join(args.output, sanitize_url(url))
         os.makedirs(url_output, exist_ok=True)
         generate_report(url, pii_findings, op_findings, idor_findings,
                         batch_findings, alias_findings, url_output)
