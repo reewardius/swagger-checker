@@ -594,6 +594,10 @@ def main():
 
     args = parser.parse_args()
 
+    if os.path.exists(args.output):
+        import shutil
+        shutil.rmtree(args.output)
+        thread_safe_print(f"[CLEAN] Removed old results folder: {args.output}")
     os.makedirs(args.output, exist_ok=True)
     headers = build_headers(args)
 
