@@ -38,23 +38,23 @@ All working GET endpoints (status code 200) are saved in `swagger_get_200.txt`.
 ### Graphql Endpoints Checker
 ```
 python3 graphql_analyzer.py -d https://target.com/graphql -t 10 -m both
-python3graphql_analyzer.py -f graphql_targets.txt -t 10 -m both
-```
-**Results Log**
-```
-...
-[SUCCESS] https://target.com/graphql :: time
-[SUCCESS] https://target.com/graphql :: animals
-[SUCCESS] https://target.com/graphql :: habits
-[SUCCESS] https://target.com/graphql :: campaigns(filialIds: "1")
-[SUCCESS] https://target.com/graphql :: certList
-[SUCCESS] https://target.coma/graphql :: offices
-[SUCCESS] https://target.com/graphql :: cities(serviceIds: "1", marketStatusIds: "1")
-...
+python3 graphql_analyzer.py -f graphql_targets.txt -t 10 -m both
 ```
 
-##### 📄 Output
 All working PoCs are saved in `graphql_results/`.
+```
+graphql_results/
+  https_target1_graphql/
+    report.md
+    pii/
+    checker/
+    idor/
+    batch/
+    aliases/
+  https_target2_graphql/
+    report.md
+    ...
+```
 
 ### JS API Hunter
 
@@ -69,7 +69,7 @@ python api_hunter.py -i alive_http_services.txt -o api_200_get.txt -t 20
 ---
 #### Bugbountytips
 
-##### Check JSON/PLAIN Content-Type
+#### Check JSON/PLAIN Content-Type
 
 ```bash
 python check-content-type.py -f swagger_get_200.txt -o content-types-results.txt
@@ -78,7 +78,7 @@ python check-content-type.py -f swagger_get_200.txt -o content-types-results.txt
 [OK] https://example.com/api/v2/status --> application/json; charset=utf-8
 ```
 
-##### IP + Ports
+#### IP + Ports
 
 ```bash
 subfinder -d <domain> -all -silent -o subs.txt && \
@@ -89,7 +89,7 @@ nuclei -l alive_http_services.txt -id openapi,swagger-api -o swagger_endpoints.t
 python3 swagger_checker_threads.py -t 100
 ```
 
-##### PTR Records
+#### PTR Records
 
 ```bash
 subfinder -d <domain> -all -silent -o subs.txt && \
@@ -101,16 +101,16 @@ nuclei -l alive_http_services.txt -id openapi,swagger-api -o swagger_endpoints.t
 python3 swagger_checker_threads.py -t 100
 ```
 
-##### Swagger/OpenAPI
+#### Swagger/OpenAPI
 ```bash
 rm -rf responses/ && httpx -l swagger_get_200.txt -sr -srd responses/ && trufflehog filesystem responses/ > trufflehog_swagger_results.txt
 ```
-##### Trufflehog Only Verified
+#### Trufflehog Only Verified
 ```bash
 rm -rf responses/ && httpx -l swagger_get_200.txt -sr -srd responses/ && trufflehog filesystem responses/ --only-verified > trufflehog_verified_swagger_results.txt
 ```
 
-##### GraphQL + Trufflehog
+#### GraphQL + Trufflehog
 ```
 trufflehog filesystem graphql_results/ --only-verified > trufflehog_verified_graphql_results.txt
 ```
