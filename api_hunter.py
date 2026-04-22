@@ -14,7 +14,6 @@ Usage:
     python api_hunter.py -u https://example.com \\
         --email-sender sender@example.com \\
         --email-recipient recipient@example.com \\
-        --github-token ghp_... \\
         --aws-region eu-central-1
 """
 
