@@ -32,6 +32,9 @@ from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 from datetime import datetime
 
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+os.environ['PATH'] = os.environ.get('PATH', '') + ':/usr/local/bin:/usr/bin:/bin:/root/go/bin'
+
 import aiohttp
 
 # ── Patterns to find API paths in JS ──────────────────────────────────────────
