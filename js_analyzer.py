@@ -14,7 +14,7 @@ import asyncio
 import aiohttp
 import json
 import argparse
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from dataclasses import dataclass, field
 from typing import Optional
 from tqdm import tqdm
@@ -389,8 +389,10 @@ async def main():
     parser = argparse.ArgumentParser(
         description="Scan JS files from a URL list for secrets, JWT artifacts, and sensitive patterns."
     )
-    parser.add_argument("input",
+    parser.add_argument("--urls", metavar="FILE",
                         help="Text file with one URL per line")
+    parser.add_argument("--url", metavar="URL",
+                        help="Scan a single URL (or domain root '/') directly instead of a file")
     parser.add_argument("--json", metavar="FILE",
                         help="Save results to a JSON report")
     parser.add_argument("--concurrency", type=int, default=10,
@@ -401,14 +403,26 @@ async def main():
                         help="Minimum severity to report (default: LOW — show everything)")
     args = parser.parse_args()
 
-    try:
-        with open(args.input, encoding="utf-8") as fh:
-            urls = list(dict.fromkeys(
-                l.strip() for l in fh if l.strip() and not l.startswith("#")
-            ))
-    except FileNotFoundError:
-        print(f"[!] File not found: {args.input}")
-        sys.exit(1)
+    if args.url:
+        # Normalize: if bare domain given, prepend https:// and ensure path is /
+        raw = args.url.strip()
+        if not urlparse(raw).scheme:
+            raw = "https://" + raw
+        parsed = urlparse(raw)
+        # If no path provided (or just empty), default to /
+        target = parsed._replace(path=parsed.path or "/").geturl()
+        urls = [target]
+    elif args.urls:
+        try:
+            with open(args.urls, encoding="utf-8") as fh:
+                urls = list(dict.fromkeys(
+                    l.strip() for l in fh if l.strip() and not l.startswith("#")
+                ))
+        except FileNotFoundError:
+            print(f"[!] File not found: {args.urls}")
+            sys.exit(1)
+    else:
+        parser.error("Provide either --url <URL> or --urls <file>")
 
     print(f"\n  JS Security Analyzer")
     print(f"{'─'*40}")
