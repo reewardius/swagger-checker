@@ -4,6 +4,8 @@ import argparse
 import threading
 import os
 import re
+import time
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -14,25 +16,65 @@ def thread_safe_print(message):
     with print_lock:
         print(message)
 
-# === Circuit Breaker ===
-_error_counts = {}      # url -> consecutive error count
-_dead_urls = set()      # urls that exceeded threshold
+# === Request tuning (set from CLI args in main(), read as globals elsewhere) ===
+REQUEST_TIMEOUT = 15     # seconds per HTTP request
+REQUEST_RETRIES = 2      # extra attempts on timeout/connection error/429/503 before giving up
+REQUEST_DELAY = 0.0      # fixed pause before every request (seconds) — throttles WAF triggers
+REQUEST_JITTER = 0.4     # random extra 0..JITTER seconds added on top of REQUEST_DELAY
+
+# === Circuit Breaker (soft / self-healing) ===
+# Instead of permanently blacklisting a host after N consecutive errors,
+# we pause requests to it for a cooldown period, then automatically resume.
+# The cooldown doubles each time the host keeps failing after a cooldown,
+# and resets back to normal as soon as a request succeeds.
+_error_counts = {}          # url -> consecutive error count
+_cooldown_until = {}        # url -> unix timestamp when requests may resume
+_cooldown_multiplier = {}   # url -> how many times cooldown has backed off
 _cb_lock = threading.Lock()
-CB_THRESHOLD = 5        # skip after this many consecutive errors
+
+CB_THRESHOLD = 5            # consecutive errors before pausing
+CB_COOLDOWN = 20            # base cooldown length in seconds
+CB_MAX_COOLDOWN = 180       # cooldown never grows past this
 
 def is_dead(url):
-    return url in _dead_urls
+    """True only while url is inside an active cooldown window."""
+    with _cb_lock:
+        until = _cooldown_until.get(url)
+        if until is None:
+            return False
+        if time.time() >= until:
+            return False  # cooldown expired — allow the next request through
+        return True
 
 def record_error(url):
     with _cb_lock:
         _error_counts[url] = _error_counts.get(url, 0) + 1
-        if _error_counts[url] >= CB_THRESHOLD and url not in _dead_urls:
-            _dead_urls.add(url)
-            thread_safe_print(f"[SKIP] {url} — {CB_THRESHOLD} consecutive errors, skipping remaining requests")
+        if _error_counts[url] >= CB_THRESHOLD:
+            mult = _cooldown_multiplier.get(url, 0)
+            cooldown = min(CB_COOLDOWN * (2 ** mult), CB_MAX_COOLDOWN)
+            _cooldown_until[url] = time.time() + cooldown
+            _cooldown_multiplier[url] = mult + 1
+            _error_counts[url] = 0
+            thread_safe_print(f"[PAUSE] {url} — {CB_THRESHOLD} consecutive errors, "
+                               f"cooling down {cooldown:.0f}s before resuming")
 
 def record_success(url):
     with _cb_lock:
-        _error_counts[url] = 0  # reset on success
+        _error_counts[url] = 0
+        _cooldown_multiplier[url] = 0  # host is healthy again — drop backoff
+
+def reset_circuit_breaker(url=None):
+    """Clear breaker state — call between check_* modes so a rough patch
+    during e.g. PII check doesn't carry a stale cooldown into IDOR check."""
+    with _cb_lock:
+        if url is None:
+            _error_counts.clear()
+            _cooldown_until.clear()
+            _cooldown_multiplier.clear()
+        else:
+            _error_counts.pop(url, None)
+            _cooldown_until.pop(url, None)
+            _cooldown_multiplier.pop(url, None)
 
 # === Auth ===
 def build_headers(args):
@@ -58,17 +100,56 @@ def prepare_results_folder(results_dir, mode, url):
     return url_dir
 
 # === GraphQL helpers ===
-def post_graphql(url, query, headers, timeout=10):
+def post_graphql(url, query, headers, timeout=None):
+    """POST a GraphQL query with throttling, retry-with-backoff on transient
+    failures (timeout / connection error / 429 / 503), and a soft circuit
+    breaker that pauses (not permanently kills) a misbehaving host."""
     if is_dead(url):
         return None
-    try:
-        resp = requests.post(url, headers=headers, json=query, timeout=timeout, verify=False)
-        if resp.status_code == 200:
-            record_success(url)
-            return resp
-        record_error(url)
-    except Exception as e:
-        thread_safe_print(f"[ERROR] {e}")
+
+    timeout = timeout if timeout is not None else REQUEST_TIMEOUT
+    last_exc = None
+
+    for attempt in range(REQUEST_RETRIES + 1):
+        # Throttle every attempt a little — cheap insurance against WAF /
+        # rate-limit triggers from bursty concurrent requests.
+        if REQUEST_DELAY or REQUEST_JITTER:
+            time.sleep(REQUEST_DELAY + random.uniform(0, REQUEST_JITTER))
+
+        try:
+            resp = requests.post(url, headers=headers, json=query, timeout=timeout, verify=False)
+        except Exception as e:
+            last_exc = e
+            if attempt < REQUEST_RETRIES:
+                backoff = (attempt + 1) * 1.5 + random.uniform(0, 0.5)
+                time.sleep(backoff)
+                continue
+            thread_safe_print(f"[ERROR] {e} (after {REQUEST_RETRIES + 1} attempts)")
+            record_error(url)
+            return None
+
+        # A WAF/rate-limit response — back off and retry, don't burn it as
+        # a hard breaker error since the endpoint itself is fine.
+        if resp.status_code in (429, 503):
+            if attempt < REQUEST_RETRIES:
+                retry_after = resp.headers.get("Retry-After")
+                backoff = float(retry_after) if retry_after and retry_after.isdigit() \
+                    else (attempt + 1) * 2.0 + random.uniform(0, 1.0)
+                thread_safe_print(f"[THROTTLE] {url} responded {resp.status_code}, "
+                                   f"backing off {backoff:.1f}s")
+                time.sleep(backoff)
+                continue
+            record_error(url)
+            return None
+
+        # Got a real HTTP response -> the endpoint is alive. A plain 400/404
+        # on one guessed query (wrong args, unknown field, etc.) is normal
+        # discovery noise and must NOT count against the breaker.
+        record_success(url)
+        return resp if resp.status_code == 200 else None
+
+    if last_exc:
+        thread_safe_print(f"[ERROR] {last_exc}")
         record_error(url)
     return None
 
@@ -265,8 +346,28 @@ def guess_value(param_name):
             return values[0]
     return "1"
 
-def build_operation_query(op_name, op_args, op_type_name, schema_types):
-    arg_parts = [f"{a}: {json.dumps(guess_value(a))}" for a in op_args]
+# GraphQL scalar kinds that must NOT be quoted as string literals.
+# ID/String/enum-like values are safe quoted (ID accepts quoted or bare
+# numbers per spec); Int/Float/Boolean are NOT — a quoted "1" against an
+# Int! argument fails GraphQL validation before the resolver ever runs.
+_NUMERIC_TYPES = {"Int", "Float"}
+_BOOLEAN_TYPES = {"Boolean"}
+
+def format_graphql_value(value, type_name=None):
+    """Format a guessed value as a GraphQL literal, respecting the arg's
+    real scalar type from introspection instead of always quoting it."""
+    if type_name in _NUMERIC_TYPES:
+        try:
+            return str(int(value)) if type_name == "Int" else str(float(value))
+        except (TypeError, ValueError):
+            return json.dumps(value)
+    if type_name in _BOOLEAN_TYPES:
+        return "true" if str(value).lower() in ("1", "true", "yes") else "false"
+    return json.dumps(value)
+
+def build_operation_query(op_name, op_args, op_type_name, schema_types, arg_types=None):
+    arg_types = arg_types or {}
+    arg_parts = [f"{a}: {format_graphql_value(guess_value(a), arg_types.get(a))}" for a in op_args]
     arg_block = f"({', '.join(arg_parts)})" if arg_parts else ""
     fields_block = ""
     if op_type_name:
@@ -275,13 +376,21 @@ def build_operation_query(op_name, op_args, op_type_name, schema_types):
     return f"{{ {op_name}{arg_block} {fields_block} }}"
 
 def extract_operations(schema):
+    """Extract root-level queryable operations — i.e. fields on the actual
+    Query type — instead of every field on every type in the schema.
+    Also carries each argument's real scalar type so callers can format
+    literals correctly (e.g. Int args must not be quoted)."""
+    query_type_name = (schema.get("queryType") or {}).get("name")
+    schema_types = schema.get("types", [])
+    query_type = next((t for t in schema_types if t.get("name") == query_type_name), None)
+    if not query_type or not query_type.get("fields"):
+        return []
     ops = []
-    for t in schema.get("types", []):
-        if t.get("fields"):
-            for f in t["fields"]:
-                args = [a["name"] for a in f.get("args", [])]
-                type_name = get_named_type(f.get("type", {}))
-                ops.append({"name": f["name"], "args": args, "type_name": type_name})
+    for f in query_type["fields"]:
+        arg_types = {a["name"]: get_named_type(a.get("type", {})) for a in f.get("args", [])}
+        type_name = get_named_type(f.get("type", {}))
+        ops.append({"name": f["name"], "args": list(arg_types.keys()),
+                    "arg_types": arg_types, "type_name": type_name})
     return ops
 
 def check_operations(url, headers, results_dir, threads, schema=None):
@@ -297,7 +406,8 @@ def check_operations(url, headers, results_dir, threads, schema=None):
     findings = []
 
     def run_op(op):
-        query_str = build_operation_query(op["name"], op["args"], op["type_name"], schema_types)
+        query_str = build_operation_query(op["name"], op["args"], op["type_name"], schema_types,
+                                           op.get("arg_types"))
         query_json = {"query": query_str}
         resp = post_graphql(url, query_json, headers)
         if is_success(resp):
@@ -347,10 +457,11 @@ def check_idor(url, headers, results_dir, threads, schema=None, idor_ids=None):
             # Build query with this specific ID, other args get defaults
             arg_parts = []
             for a in op["args"]:
+                a_type = op.get("arg_types", {}).get(a)
                 if a == id_arg:
-                    arg_parts.append(f"{a}: {json.dumps(test_id)}")
+                    arg_parts.append(f"{a}: {format_graphql_value(test_id, a_type)}")
                 else:
-                    arg_parts.append(f"{a}: {json.dumps(guess_value(a))}")
+                    arg_parts.append(f"{a}: {format_graphql_value(guess_value(a), a_type)}")
             arg_block = f"({', '.join(arg_parts)})"
             fields_block = ""
             if op["type_name"]:
@@ -415,7 +526,8 @@ def check_batch(url, headers, results_dir, schema=None):
 
     batch_payload = []
     for op in operations:
-        query_str = build_operation_query(op["name"], op["args"], op["type_name"], schema_types)
+        query_str = build_operation_query(op["name"], op["args"], op["type_name"], schema_types,
+                                           op.get("arg_types"))
         batch_payload.append({"query": query_str})
 
     try:
@@ -471,8 +583,9 @@ def check_aliases(url, headers, results_dir, schema=None, alias_count=10):
         for i, test_id in enumerate(ids):
             arg_parts = []
             for a in op["args"]:
+                a_type = op.get("arg_types", {}).get(a)
                 val = str(test_id) if "id" in a.lower() else guess_value(a)
-                arg_parts.append(f"{a}: {json.dumps(val)}")
+                arg_parts.append(f"{a}: {format_graphql_value(val, a_type)}")
             arg_block = f"({', '.join(arg_parts)})"
             fields_block = ""
             if op["type_name"]:
@@ -578,8 +691,25 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-d", "--domain", help="Single GraphQL endpoint URL")
     group.add_argument("-f", "--file", help="File with list of endpoints")
-    parser.add_argument("-t", "--threads", type=int, default=5)
+    parser.add_argument("-t", "--threads", type=int, default=3,
+                        help="Concurrent request workers (default: 3 — lower is gentler on WAF/rate limits)")
     parser.add_argument("-o", "--output", default="graphql_results")
+
+    # Stability / throttling options
+    perf = parser.add_argument_group("Stability & throttling")
+    perf.add_argument("--timeout", type=float, default=15,
+                       help="Per-request timeout in seconds (default: 15)")
+    perf.add_argument("--retries", type=int, default=2,
+                       help="Extra attempts on timeout/connection error/429/503 before giving up (default: 2)")
+    perf.add_argument("--delay", type=float, default=0.0,
+                       help="Fixed pause before every request, in seconds — throttles WAF/rate-limit triggers (default: 0)")
+    perf.add_argument("--jitter", type=float, default=0.4,
+                       help="Random extra 0..N seconds added on top of --delay (default: 0.4)")
+    perf.add_argument("--cb-threshold", type=int, default=5,
+                       help="Consecutive errors before pausing a host (default: 5)")
+    perf.add_argument("--cb-cooldown", type=float, default=20,
+                       help="Base cooldown in seconds when a host is paused; doubles on repeat failures, "
+                            "capped at 10x this value (default: 20)")
 
     # Auth options
     auth = parser.add_argument_group("Authentication")
@@ -595,6 +725,17 @@ def main():
                         help="Number of aliases to use in alias check (default: 10)")
 
     args = parser.parse_args()
+
+    # Wire CLI tuning into the module-level knobs read by post_graphql()/breaker.
+    global REQUEST_TIMEOUT, REQUEST_RETRIES, REQUEST_DELAY, REQUEST_JITTER
+    global CB_THRESHOLD, CB_COOLDOWN, CB_MAX_COOLDOWN
+    REQUEST_TIMEOUT = args.timeout
+    REQUEST_RETRIES = args.retries
+    REQUEST_DELAY = args.delay
+    REQUEST_JITTER = args.jitter
+    CB_THRESHOLD = args.cb_threshold
+    CB_COOLDOWN = args.cb_cooldown
+    CB_MAX_COOLDOWN = args.cb_cooldown * 10
 
     if os.path.exists(args.output):
         import shutil
@@ -620,23 +761,28 @@ def main():
         pii_findings = op_findings = idor_findings = batch_findings = alias_findings = []
 
         if args.mode in ["pii", "all"]:
+            reset_circuit_breaker(url)
             thread_safe_print(f"\n[*] PII Check")
             pii_findings = check_pii(url, headers, args.output, args.threads)
 
         if args.mode in ["checker", "all"]:
+            reset_circuit_breaker(url)
             thread_safe_print(f"\n[*] Operations Check")
             op_findings = check_operations(url, headers, args.output, args.threads, schema=schema)
 
         if args.mode in ["idor", "all"]:
+            reset_circuit_breaker(url)
             thread_safe_print(f"\n[*] IDOR Check")
             idor_findings = check_idor(url, headers, args.output, args.threads,
                                        schema=schema, idor_ids=args.idor_ids)
 
         if args.mode in ["batch", "all"]:
+            reset_circuit_breaker(url)
             thread_safe_print(f"\n[*] Batch Check")
             batch_findings = check_batch(url, headers, args.output, schema=schema)
 
         if args.mode in ["aliases", "all"]:
+            reset_circuit_breaker(url)
             thread_safe_print(f"\n[*] Aliases Check")
             alias_findings = check_aliases(url, headers, args.output,
                                            schema=schema, alias_count=args.alias_count)
