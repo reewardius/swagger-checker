@@ -21,6 +21,7 @@ JS Security Analyzer — Full Pipeline
     --no-email           Не отправлять письмо
     --excel FILE         Путь к Excel-отчёту (default: findings.xlsx)
     --json FILE          Дополнительно сохранить JSON-отчёт
+    --email-domains D1,D2 Искать email на указанных доменах (по умолчанию выключено)
 
 Dependencies:
     pip install aiohttp tqdm openpyxl boto3
@@ -99,6 +100,8 @@ PATTERNS: list[tuple[str, str, str]] = [
      r'[Bb]earer\s+([A-Za-z0-9_\-\.~+/]{20,})'),
     (HIGH, "API Key / Token Field",
      r'(?:auth[_-]?token|access[_-]?token|refresh[_-]?token|api[_-]?token)\s*[=:]\s*["\']([A-Za-z0-9_\-\.]{16,})["\']'),
+    (HIGH, "API Key / Raw JWT Token",
+     r'\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b'),
 
     # Databases
     (CRITICAL, "Database / Connection String with Credentials",
@@ -139,7 +142,59 @@ PATTERNS: list[tuple[str, str, str]] = [
      r'shpat_[A-Za-z0-9]{32}'),
     (HIGH, "Cloud / Mailgun API Key",
      r'key-[0-9a-f]{32}'),
+
+    # AI providers
+    (CRITICAL, "AI / OpenAI API Key",
+     r'sk-proj-[A-Za-z0-9_-]{20,}'),
+    (CRITICAL, "AI / Anthropic API Key",
+     r'sk-ant-[A-Za-z0-9_-]{20,}'),
+
+    # Infra / registries
+    (CRITICAL, "Cloud / DigitalOcean Personal Access Token",
+     r'dop_v1_[a-f0-9]{64}'),
+    (HIGH, "Cloud / Docker Hub Access Token",
+     r'dckr_pat_[A-Za-z0-9_-]{27,}'),
+    (HIGH, "Cloud / PyPI API Token",
+     r'pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}'),
+    (HIGH, "Cloud / New Relic License Key",
+     r'NRAK-[A-Z0-9]{27}'),
+
+    # Payments
+    (CRITICAL, "Payment / PayPal-Braintree Access Token",
+     r'access_token\$production\$[a-z0-9]{16}\$[a-f0-9]{32}'),
+    (CRITICAL, "Payment / Square Access Token",
+     r'sq0atp-[A-Za-z0-9_-]{22}'),
+    (CRITICAL, "Payment / Square OAuth Secret",
+     r'sq0csp-[A-Za-z0-9_-]{43}'),
+
+    # Communications
+    (HIGH, "Cloud / Discord Bot Token",
+     r'\b[MN][A-Za-z\d_-]{23}\.[A-Za-z\d_-]{6}\.[A-Za-z\d_-]{27}\b'),
 ]
+
+# ─── Email / internal-domain patterns (opt-in via --email-domains) ────────────
+# Не добавляются в PATTERNS по умолчанию — активны только когда пользователь
+# явно передал --email-domains. Категория всегда начинается с "Email / ",
+# это используется в analyze_content() чтобы обойти is_trivial() (email
+# адреса содержат точки/@ и без этого попадут под фильтр минифицированного JS).
+
+EMAIL_SEVERITY = MEDIUM
+EXTRA_PATTERNS: list[tuple[str, str, str]] = []
+
+def build_email_patterns(domains: list[str]) -> list[tuple[str, str, str]]:
+    """
+    Один regex на ВСЕ домены (альтернация), а не по паттерну на каждый домен —
+    иначе с ростом числа доменов сканирование линейно замедляется, т.к. каждый
+    паттерн — это отдельный полный проход по содержимому файла.
+    Конкретный домен, под который подошло совпадение, извлекается из самого
+    совпадения (после @) на этапе анализа — категория присваивается динамически.
+    """
+    clean = [d.strip().lstrip("@") for d in domains if d.strip()]
+    if not clean:
+        return []
+    alternation = "|".join(re.escape(d) for d in clean)
+    pattern = r'[A-Za-z0-9._%+-]+@(?:' + alternation + r')\b'
+    return [(EMAIL_SEVERITY, "Email / Internal Domain", pattern)]
 
 # ─── False-positive filter ────────────────────────────────────────────────────
 
@@ -169,8 +224,16 @@ def is_trivial(value: str) -> bool:
     SAFE_PREFIXES = (
         'AKIA', 'sk_live_', 'sk_test_', 'ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_',
         'SG.', 'xox', 'npm_', 'shpat_', 'AIza', 'key-',
+        'sk-proj-', 'sk-ant-', 'dop_v1_', 'dckr_pat_', 'pypi-AgEIcHlwaS5vcmc',
+        'NRAK-', 'sq0atp-', 'sq0csp-',
     )
     if any(v.startswith(p) for p in SAFE_PREFIXES): return False
+    # Raw JWT (header.payload.signature, header/payload are base64 JSON → start with "eyJ")
+    if re.match(r'^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$', v): return False
+    # Discord bot token (contains dots, would otherwise hit the JS-expression filter below)
+    if re.match(r'^[MN][A-Za-z\d_-]{23}\.[A-Za-z\d_-]{6}\.[A-Za-z\d_-]{27}$', v): return False
+    # PayPal/Braintree access token (contains $, fixed structure)
+    if re.match(r'^access_token\$production\$[a-z0-9]{16}\$[a-f0-9]{32}$', v): return False
     # DB connection strings with credentials — always keep
     if re.match(r'^[a-z+]+://\S+:\S+@\S+', v): return False
 
@@ -211,26 +274,48 @@ class FileResult:
 
 # ─── Analysis ─────────────────────────────────────────────────────────────────
 
+# Раньше PATTERNS/EXTRA_PATTERNS компилировались заново для КАЖДОГО скачанного
+# файла внутри analyze_content — при сотнях JS-файлов это сотни лишних
+# re.compile() на каждый паттерн. Теперь компилируем один раз и переиспользуем.
+_COMPILED_PATTERNS_CACHE: Optional[list[tuple[str, str, "re.Pattern"]]] = None
+
+def precompile_patterns() -> None:
+    global _COMPILED_PATTERNS_CACHE
+    compiled = []
+    for severity, category, pattern in PATTERNS + EXTRA_PATTERNS:
+        try:
+            compiled.append((severity, category, re.compile(pattern, re.IGNORECASE)))
+        except re.error:
+            continue
+    _COMPILED_PATTERNS_CACHE = compiled
+
+def get_compiled_patterns() -> list[tuple[str, str, "re.Pattern"]]:
+    if _COMPILED_PATTERNS_CACHE is None:
+        precompile_patterns()
+    return _COMPILED_PATTERNS_CACHE
+
 def analyze_content(content: str, min_severity: str) -> list[Finding]:
     findings: list[Finding] = []
     lines = content.splitlines()
     min_order = SEVERITY_ORDER[min_severity]
 
-    for severity, category, pattern in PATTERNS:
+    for severity, category, compiled in get_compiled_patterns():
         if SEVERITY_ORDER[severity] > min_order:
             continue
-        try:
-            compiled = re.compile(pattern, re.IGNORECASE)
-        except re.error:
-            continue
+        is_email_pattern = category == "Email / Internal Domain"
         for line_num, line in enumerate(lines, start=1):
             for m in compiled.finditer(line):
                 value = m.group(1) if m.lastindex else m.group(0)
-                if is_trivial(value):
+                # is_trivial() эвристики заточены под "похоже на секрет";
+                # email-адреса (точки, @) под них не подходят и не должны фильтроваться.
+                if not is_email_pattern and is_trivial(value):
                     continue
+                finding_category = category
+                if is_email_pattern and "@" in value:
+                    finding_category = f"Email / {value.rsplit('@', 1)[-1]}"
                 findings.append(Finding(
                     severity=severity,
-                    category=category,
+                    category=finding_category,
                     match=value[:250],
                     line_number=line_num,
                     line_content=line.strip()[:350],
@@ -361,7 +446,8 @@ async def step_scan(urls: list[str], concurrency: int, severity: str) -> list[Fi
     print(f"  URLs    : {len(urls)}")
     print(f"  Threads : {concurrency}")
     print(f"  Min sev : {severity}")
-    print(f"  Patterns: {len(PATTERNS)}\n")
+    print(f"  Patterns: {len(PATTERNS) + len(EXTRA_PATTERNS)}"
+          f"{f' (+{len(EXTRA_PATTERNS)} email)' if EXTRA_PATTERNS else ''}\n")
 
     sem = asyncio.Semaphore(concurrency)
     connector = aiohttp.TCPConnector(ssl=False, limit=concurrency)
@@ -702,8 +788,19 @@ async def main():
                         help="Путь к Excel-отчёту (default: findings.xlsx)")
     parser.add_argument("--json", metavar="FILE",
                         help="Дополнительно сохранить JSON-отчёт")
+    parser.add_argument("--email-domains", metavar="DOMAINS",
+                        help="Опционально: искать email-адреса на указанных доменах "
+                             "(через запятую, напр. temabit.com,foodtech.team). "
+                             "По умолчанию поиск email отключён.")
 
     args = parser.parse_args()
+
+    if args.email_domains:
+        domains = [d for d in args.email_domains.split(",") if d.strip()]
+        EXTRA_PATTERNS.extend(build_email_patterns(domains))
+        print(f"  [i] Email search enabled for domains: {', '.join(domains)}")
+
+    precompile_patterns()  # один раз, до начала конкурентного сканирования
 
     # Load original URL list and normalize
     def normalize_url(raw: str) -> str:
