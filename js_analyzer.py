@@ -33,6 +33,7 @@ import sys
 import asyncio
 import aiohttp
 import json
+import base64
 import argparse
 import subprocess
 import tempfile
@@ -180,6 +181,7 @@ PATTERNS: list[tuple[str, str, str]] = [
 
 EMAIL_SEVERITY = MEDIUM
 EXTRA_PATTERNS: list[tuple[str, str, str]] = []
+EMAIL_DOMAINS: list[str] = []  # для вывода в статистике (EXTRA_PATTERNS всегда содержит 1 объединённый regex)
 
 def build_email_patterns(domains: list[str]) -> list[tuple[str, str, str]]:
     """
@@ -197,6 +199,12 @@ def build_email_patterns(domains: list[str]) -> list[tuple[str, str, str]]:
     return [(EMAIL_SEVERITY, "Email / Internal Domain", pattern)]
 
 # ─── False-positive filter ────────────────────────────────────────────────────
+
+# Общая проверка "это значение целиком выглядит как JWT" — используется и
+# в is_trivial() (чтобы не отбрасывать JWT как минифицированный JS-код),
+# и в analyze_content() (чтобы generic-паттроны типа "Token Field" / "Bearer
+# Token" не дублировали находку, которую уже покрывает "Raw JWT Token").
+_JWT_FULL_RE = re.compile(r'^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$')
 
 IGNORE_SUBSTRINGS = {
     'undefined', 'null', 'true', 'false', 'none', 'empty', 'placeholder',
@@ -229,7 +237,7 @@ def is_trivial(value: str) -> bool:
     )
     if any(v.startswith(p) for p in SAFE_PREFIXES): return False
     # Raw JWT (header.payload.signature, header/payload are base64 JSON → start with "eyJ")
-    if re.match(r'^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$', v): return False
+    if _JWT_FULL_RE.match(v): return False
     # Discord bot token (contains dots, would otherwise hit the JS-expression filter below)
     if re.match(r'^[MN][A-Za-z\d_-]{23}\.[A-Za-z\d_-]{6}\.[A-Za-z\d_-]{27}$', v): return False
     # PayPal/Braintree access token (contains $, fixed structure)
@@ -294,6 +302,53 @@ def get_compiled_patterns() -> list[tuple[str, str, "re.Pattern"]]:
         precompile_patterns()
     return _COMPILED_PATTERNS_CACHE
 
+# ── JWT payload decode-and-rescan ───────────────────────────────────────────
+# Секреты/email внутри JWT claims (upn, email, custom claims) не видны как
+# обычный текст в исходнике — только после base64url-декодирования payload
+# части токена. Поэтому каждый найденный JWT дополнительно декодируется и
+# его payload прогоняется через ВСЕ активные паттерны (включая --email-domains).
+
+_JWT_STRUCTURE_RE = re.compile(
+    r'\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b'
+)
+
+def _b64url_decode(segment: str) -> Optional[str]:
+    padded = segment + "=" * (-len(segment) % 4)
+    try:
+        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+def scan_jwt_payloads(content: str, min_order: int) -> list[Finding]:
+    extra: list[Finding] = []
+    for line_num, line in enumerate(content.splitlines(), start=1):
+        for m in _JWT_STRUCTURE_RE.finditer(line):
+            parts = m.group(0).split(".")
+            if len(parts) < 2:
+                continue
+            decoded = _b64url_decode(parts[1])
+            if not decoded or '"' not in decoded:
+                continue
+            for severity, category, compiled in get_compiled_patterns():
+                if SEVERITY_ORDER[severity] > min_order:
+                    continue
+                is_email_pattern = category == "Email / Internal Domain"
+                for dm in compiled.finditer(decoded):
+                    value = dm.group(1) if dm.lastindex else dm.group(0)
+                    if not is_email_pattern and is_trivial(value):
+                        continue
+                    finding_category = category
+                    if is_email_pattern and "@" in value:
+                        finding_category = f"Email / {value.rsplit('@', 1)[-1]}"
+                    extra.append(Finding(
+                        severity=severity,
+                        category=f"{finding_category} (в JWT payload)",
+                        match=value[:250],
+                        line_number=line_num,
+                        line_content=line.strip()[:350],
+                    ))
+    return extra
+
 def analyze_content(content: str, min_severity: str) -> list[Finding]:
     findings: list[Finding] = []
     lines = content.splitlines()
@@ -303,9 +358,15 @@ def analyze_content(content: str, min_severity: str) -> list[Finding]:
         if SEVERITY_ORDER[severity] > min_order:
             continue
         is_email_pattern = category == "Email / Internal Domain"
+        is_jwt_pattern   = category == "API Key / Raw JWT Token"
         for line_num, line in enumerate(lines, start=1):
             for m in compiled.finditer(line):
                 value = m.group(1) if m.lastindex else m.group(0)
+                # Значение целиком выглядит как JWT — пусть его репортит только
+                # специализированное правило "Raw JWT Token", а не generic
+                # правила (Token Field, Bearer Token, API Key), иначе дублирование.
+                if not is_jwt_pattern and _JWT_FULL_RE.match(value):
+                    continue
                 # is_trivial() эвристики заточены под "похоже на секрет";
                 # email-адреса (точки, @) под них не подходят и не должны фильтроваться.
                 if not is_email_pattern and is_trivial(value):
@@ -320,6 +381,8 @@ def analyze_content(content: str, min_severity: str) -> list[Finding]:
                     line_number=line_num,
                     line_content=line.strip()[:350],
                 ))
+
+    findings.extend(scan_jwt_payloads(content, min_order))
 
     seen: set[tuple] = set()
     unique: list[Finding] = []
@@ -447,7 +510,7 @@ async def step_scan(urls: list[str], concurrency: int, severity: str) -> list[Fi
     print(f"  Threads : {concurrency}")
     print(f"  Min sev : {severity}")
     print(f"  Patterns: {len(PATTERNS) + len(EXTRA_PATTERNS)}"
-          f"{f' (+{len(EXTRA_PATTERNS)} email)' if EXTRA_PATTERNS else ''}\n")
+          f"{f' (+ email: {len(EMAIL_DOMAINS)} domain(s) — ' + ', '.join(EMAIL_DOMAINS) + ')' if EMAIL_DOMAINS else ''}\n")
 
     sem = asyncio.Semaphore(concurrency)
     connector = aiohttp.TCPConnector(ssl=False, limit=concurrency)
@@ -798,6 +861,7 @@ async def main():
     if args.email_domains:
         domains = [d for d in args.email_domains.split(",") if d.strip()]
         EXTRA_PATTERNS.extend(build_email_patterns(domains))
+        EMAIL_DOMAINS.extend(d.strip().lstrip("@") for d in domains)
         print(f"  [i] Email search enabled for domains: {', '.join(domains)}")
 
     precompile_patterns()  # один раз, до начала конкурентного сканирования
