@@ -2,11 +2,17 @@
 """
 JS Security Analyzer — Full Pipeline
 =====================================
-Запуск:
-    python3 js_analyzer.py --urls alive_http_services_advanced.txt
+Запуск (готовый список URL/хостов):
+    python3 js_analyzer.py scan --urls alive_http_services_advanced.txt
+
+Запуск (только корневые домены — поддомены собираются автоматически через
+SecurityTrails):
+    python3 js_analyzer.py scan -f root.txt
 
 Что происходит автоматически:
-  1. getJS   → собирает все JS-ссылки с хостов из --urls файла
+  0. subdomains → (только с -f/--roots) для каждого домена из файла
+               запрашивает поддомены через SecurityTrails API
+  1. getJS   → собирает все JS-ссылки с хостов (из -f/--roots или --urls)
   2. merge   → объединяет оригинальные URL + JS-ссылки (дедупликация)
                сохраняет объединённый список в <input>_scan_targets.txt
   3. scan    → сканирует все URL на секреты / sensitive patterns
@@ -14,24 +20,30 @@ JS Security Analyzer — Full Pipeline
   5. email   → отправляет отчёт через AWS SES
 
 Дополнительные опции:
-    --concurrency N      Параллельных HTTP запросов (default: 10)
-    --severity LEVEL     Минимальный severity: CRITICAL/HIGH/MEDIUM/LOW (default: LOW)
-    --getjs-threads N    Потоки для getJS (default: 50)
-    --no-getjs           Пропустить этап getJS, сканировать только --urls файл
-    --no-email           Не отправлять письмо
-    --excel FILE         Путь к Excel-отчёту (default: findings.xlsx)
-    --json FILE          Дополнительно сохранить JSON-отчёт
+    -f, --roots FILE     Файл с корневыми доменами — поддомены собираются
+                          автоматически через SecurityTrails (вместо --urls)
+    -k, --st-api-key KEY API-ключ SecurityTrails (или переменная ST_API_KEY)
+    --children-only       SecurityTrails: только прямые поддомены (без вложенных)
+    --concurrency N       Параллельных HTTP запросов (default: 10)
+    --severity LEVEL      Минимальный severity: CRITICAL/HIGH/MEDIUM/LOW (default: LOW)
+    --getjs-threads N     Потоки для getJS (default: 50)
+    --no-getjs            Пропустить этап getJS, сканировать только исходный список
+    --no-email            Не отправлять письмо
+    --excel FILE          Путь к Excel-отчёту (default: findings.xlsx)
+    --json FILE           Дополнительно сохранить JSON-отчёт
     --email-domains D1,D2 Искать email на указанных доменах (по умолчанию выключено)
 
 Dependencies:
-    pip install aiohttp tqdm openpyxl boto3
+    pip install aiohttp tqdm openpyxl boto3 requests
     go install github.com/003random/getJS@latest
 """
 
 import re
 import sys
+import time
 import asyncio
 import aiohttp
+import requests
 import json
 import base64
 import argparse
@@ -49,6 +61,8 @@ from tqdm import tqdm
 SES_SENDER    = "appsec@fozzy.ua"
 SES_RECIPIENT = "dmytr.lysenko@temabit.com"
 SES_REGION    = "eu-central-1"
+
+SECURITYTRAILS_API_URL = "https://api.securitytrails.com/v1/domain/{domain}/subdomains"
 
 # ─── Severity levels ──────────────────────────────────────────────────────────
 
@@ -77,6 +91,8 @@ PATTERNS: list[tuple[str, str, str]] = [
     # Passwords
     (CRITICAL, "Password / In URL DSN",
      r'https?://[A-Za-z0-9._%-]{2,}:([^@\s"\'`]{4,})@[A-Za-z0-9._-]{4,}'),
+    (CRITICAL, "Password / Field Assignment",
+     r'(?<![A-Za-z])(?:password|passwd|pwd|user[_-]?pass(?:word)?)\s*[=:]\s*["\']([^"\']{4,})["\']'),
 
     # Usernames
     (HIGH, "Username / Field Assignment",
@@ -89,6 +105,8 @@ PATTERNS: list[tuple[str, str, str]] = [
      r'(?:private[_-]?key|privateKey|priv[_-]?key)\s*[=:]\s*["\']([^"\']{10,})["\']'),
     (CRITICAL, "Secret / PEM Block",
      r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
+    (CRITICAL, "Secret / PGP Private Key Block",
+     r'-----BEGIN PGP PRIVATE KEY BLOCK-----'),
     (CRITICAL, "Secret / JWT Signing Key",
      r'(?:jwt[_-]?secret|jwtSecret|jwt[_-]?key|signing[_-]?secret)\s*[=:]\s*["\']([^"\']{6,})["\']'),
     (HIGH, "Secret / Base64 Encoded Value",
@@ -143,6 +161,41 @@ PATTERNS: list[tuple[str, str, str]] = [
      r'shpat_[A-Za-z0-9]{32}'),
     (HIGH, "Cloud / Mailgun API Key",
      r'key-[0-9a-f]{32}'),
+
+    # Git / CI hosting
+    (CRITICAL, "Cloud / GitHub Fine-Grained PAT",
+     r'github_pat_[A-Za-z0-9_]{82}'),
+    (CRITICAL, "Cloud / GitLab Personal Access Token",
+     r'glpat-[A-Za-z0-9\-_]{20}'),
+    (HIGH, "Cloud / Terraform Cloud Token",
+     r'[A-Za-z0-9]{14}\.atlasv1\.[A-Za-z0-9\-_=]{60,}'),
+    (HIGH, "Cloud / Postman API Key",
+     r'PMAK-[a-f0-9]{24}-[a-f0-9]{34}'),
+
+    # OAuth / identity secrets
+    (CRITICAL, "Cloud / Google OAuth Client Secret",
+     r'GOCSPX-[A-Za-z0-9_-]{28}'),
+    (HIGH, "Cloud / Google OAuth Refresh Token",
+     r'\b1//[0-9A-Za-z_-]{35,}\b'),
+    (HIGH, "Cloud / Facebook Graph API Token",
+     r'(?:access[_-]?token|fb[_-]?access[_-]?token|facebook[_-]?access[_-]?token|'
+     r'page[_-]?access[_-]?token|graph[_-]?api[_-]?token)\s*[=:]\s*'
+     r'["\'](EAA[A-Za-z0-9]{50,})["\']'),
+    (HIGH, "Cloud / Okta API Token",
+     r'(?<![A-Za-z0-9])00[A-Za-z0-9_-]{40}(?![A-Za-z0-9_-])'),
+    (HIGH, "Cloud / HashiCorp Vault Token",
+     r'\bhvs\.[A-Za-z0-9]{90,100}\b'),
+
+    # SaaS dev-tool tokens
+    (HIGH, "Cloud / Notion Integration Token",
+     r'secret_[A-Za-z0-9]{43}'),
+    (HIGH, "Cloud / Sentry Auth Token",
+     r'sntrys_[A-Za-z0-9_+/=]{60,}'),
+    (HIGH, "Cloud / Linear API Key",
+     r'lin_api_[A-Za-z0-9]{40}'),
+    (HIGH, "Cloud / Twitter(X) Bearer Token",
+     r'(?:bearer[_-]?token|twitter[_-]?bearer|x[_-]?bearer[_-]?token)\s*[=:]\s*'
+     r'["\'](AAAAAAAAAAAAAAAAAAAAA[A-Za-z0-9%]{80,})["\']'),
 
     # AI providers
     (CRITICAL, "AI / OpenAI API Key",
@@ -234,6 +287,8 @@ def is_trivial(value: str) -> bool:
         'SG.', 'xox', 'npm_', 'shpat_', 'AIza', 'key-',
         'sk-proj-', 'sk-ant-', 'dop_v1_', 'dckr_pat_', 'pypi-AgEIcHlwaS5vcmc',
         'NRAK-', 'sq0atp-', 'sq0csp-',
+        'github_pat_', 'glpat-', 'PMAK-', 'GOCSPX-', 'secret_', 'sntrys_',
+        'lin_api_', 'EAA', 'AAAAAAAAAAAAAAAAAAAAA',
     )
     if any(v.startswith(p) for p in SAFE_PREFIXES): return False
     # Raw JWT (header.payload.signature, header/payload are base64 JSON → start with "eyJ")
@@ -244,6 +299,11 @@ def is_trivial(value: str) -> bool:
     if re.match(r'^access_token\$production\$[a-z0-9]{16}\$[a-f0-9]{32}$', v): return False
     # DB connection strings with credentials — always keep
     if re.match(r'^[a-z+]+://\S+:\S+@\S+', v): return False
+    # HashiCorp Vault token (contains a dot right after "hvs", would otherwise
+    # hit the JS-expression filter below)
+    if re.match(r'^hvs\.[A-Za-z0-9]{90,100}$', v): return False
+    # Terraform Cloud/Enterprise token (contains ".atlasv1.", same reason)
+    if re.match(r'^[A-Za-z0-9]{14}\.atlasv1\.[A-Za-z0-9\-_=]{60,}$', v): return False
 
     if any(ign in v.lower() for ign in IGNORE_SUBSTRINGS): return True
     if v in UNICODE_LABEL_WORDS: return True
@@ -349,6 +409,39 @@ def scan_jwt_payloads(content: str, min_order: int) -> list[Finding]:
                     ))
     return extra
 
+# ── HTTP Basic Auth header decode-and-rescan ────────────────────────────────
+# "Authorization: Basic <base64>" кодирует "user:password" — сам base64-блок
+# не матчится ни одним generic-паттерном (нет разделителей), поэтому его
+# нужно отдельно найти по контексту заголовка, декодировать и, если внутри
+# действительно есть "user:pass", зарепортить как находку.
+
+_BASIC_AUTH_RE = re.compile(
+    r'(?:Authorization|authorization)["\']?[)\]]?\s*[:=,]\s*["\']?Basic\s+([A-Za-z0-9+/]{8,}={0,2})'
+)
+
+def scan_basic_auth(content: str) -> list[Finding]:
+    extra: list[Finding] = []
+    for line_num, line in enumerate(content.splitlines(), start=1):
+        for m in _BASIC_AUTH_RE.finditer(line):
+            token = m.group(1)
+            padded = token + "=" * (-len(token) % 4)
+            try:
+                decoded = base64.b64decode(padded, validate=False).decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+            # Настоящий Basic Auth — это "user:pass"; без ':' это, скорее
+            # всего, случайно похожий на base64 мусор, а не реальный заголовок.
+            if ":" not in decoded or is_trivial(decoded.split(":", 1)[1]):
+                continue
+            extra.append(Finding(
+                severity=CRITICAL,
+                category="Password / HTTP Basic Auth Header (decoded)",
+                match=decoded[:250],
+                line_number=line_num,
+                line_content=line.strip()[:350],
+            ))
+    return extra
+
 def analyze_content(content: str, min_severity: str) -> list[Finding]:
     findings: list[Finding] = []
     lines = content.splitlines()
@@ -383,6 +476,7 @@ def analyze_content(content: str, min_severity: str) -> list[Finding]:
                 ))
 
     findings.extend(scan_jwt_payloads(content, min_order))
+    findings.extend(scan_basic_auth(content))
 
     seen: set[tuple] = set()
     unique: list[Finding] = []
@@ -393,6 +487,28 @@ def analyze_content(content: str, min_severity: str) -> list[Finding]:
             unique.append(f)
     unique.sort(key=lambda f: (SEVERITY_ORDER[f.severity], f.line_number))
     return unique
+
+# ─── URL normalization ─────────────────────────────────────────────────────────
+
+def normalize_url(raw: str) -> str:
+    """Ensure URL has scheme and at least '/' as path so the root is scanned.
+
+    Also required before handing hosts to getJS: it parses -input lines with
+    Go's raw url.Parse() and does NOT add a scheme itself — a bare hostname
+    like "www.example.com" parses "successfully" into a malformed URL, then
+    silently fails at request time ("unsupported protocol scheme"), and that
+    failure is swallowed unless getJS is run with -verbose. So any host list
+    that didn't already come with a scheme (e.g. raw SecurityTrails output)
+    must be normalized through this function before it reaches getJS.
+    """
+    raw = raw.strip()
+    if not urlparse(raw).scheme:
+        raw = "https://" + raw
+    p = urlparse(raw)
+    # If no path at all, default to /
+    if not p.path:
+        raw = p._replace(path="/").geturl()
+    return raw
 
 # ─── HTTP fetch ───────────────────────────────────────────────────────────────
 
@@ -425,7 +541,103 @@ async def fetch_and_analyze(
         return FileResult(url=url, status="error", error=str(e))
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — getJS
+# STEP 1 — SecurityTrails: root domains → subdomains
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_subdomains(domain: str, api_key: str, children_only: bool = False) -> list[str]:
+    """
+    Запрашивает поддомены для указанного домена через SecurityTrails API.
+    https://docs.securitytrails.com/reference/domain-subdomains
+
+    :param domain: основной домен, например 'example.com'
+    :param api_key: API-ключ SecurityTrails
+    :param children_only: True — только прямые поддомены (без вложенных)
+    :return: список полных доменных имён (subdomain + '.' + domain)
+    """
+    headers = {
+        "Accept": "application/json",
+        "APIKEY": api_key,
+    }
+    params = {"children_only": str(children_only).lower()}
+
+    resp = requests.get(
+        SECURITYTRAILS_API_URL.format(domain=domain),
+        headers=headers,
+        params=params,
+        timeout=15,
+    )
+
+    if resp.status_code == 429:
+        # Превышен лимит запросов — ждём и пробуем ещё раз
+        retry_after = int(resp.headers.get("Retry-After", 5))
+        print(f"  {SEVERITY_COLOR[MEDIUM]}[!] Rate limit на {domain}, повтор через {retry_after} сек...{RESET}")
+        time.sleep(retry_after)
+        return get_subdomains(domain, api_key, children_only)
+
+    resp.raise_for_status()
+    data = resp.json()
+
+    subdomains = data.get("subdomains", [])
+    return [f"{s}.{domain}" if s else domain for s in subdomains]
+
+def step_subdomains(roots_file: str, api_key: str, children_only: bool, save_path: str) -> list[str]:
+    """
+    Читает корневые домены из roots_file, для каждого запрашивает поддомены
+    через SecurityTrails, объединяет и дедуплицирует результат.
+    Сохраняет полный список в save_path для аудита.
+    """
+    print(f"\n{'═'*72}")
+    print(f"{BOLD}  [1/6] SecurityTrails — enumerating subdomains{RESET}")
+    print(f"{'─'*72}")
+
+    try:
+        with open(roots_file, encoding="utf-8") as fh:
+            roots = list(dict.fromkeys(
+                l.strip() for l in fh if l.strip() and not l.strip().startswith("#")
+            ))
+    except OSError as e:
+        print(f"  {SEVERITY_COLOR[CRITICAL]}✗  Не удалось прочитать {roots_file}: {e}{RESET}")
+        return []
+
+    if not roots:
+        print(f"  {SEVERITY_COLOR[CRITICAL]}✗  Файл с корневыми доменами пуст.{RESET}")
+        return []
+
+    print(f"  Root domains: {len(roots)}")
+    print(f"  Children only: {children_only}\n")
+
+    all_subdomains: list[str] = []
+    for domain in roots:
+        try:
+            found = get_subdomains(domain, api_key, children_only)
+        except requests.HTTPError as e:
+            print(f"  {SEVERITY_COLOR[HIGH]}⚠  {domain}: HTTP ошибка — {e}{RESET}")
+            continue
+        except requests.RequestException as e:
+            print(f"  {SEVERITY_COLOR[HIGH]}⚠  {domain}: ошибка запроса — {e}{RESET}")
+            continue
+
+        print(f"  {GREEN}✓  {domain}: {len(found)} поддомен(ов){RESET}")
+        all_subdomains.extend(found)
+
+    # Дедупликация с сохранением порядка
+    all_subdomains = list(dict.fromkeys(all_subdomains))
+
+    # SecurityTrails отдаёт голые хостнеймы без схемы (www.example.com).
+    # getJS парсит -input построчно через Go url.Parse() и НЕ добавляет схему
+    # сам — без http(s):// он тихо ничего не найдёт (см. normalize_url()).
+    # Поэтому сохраняем и возвращаем уже нормализованный список.
+    normalized = list(dict.fromkeys(normalize_url(s) for s in all_subdomains))
+
+    with open(save_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(normalized))
+
+    print(f"\n  {GREEN}✓  {len(normalized)} уникальных поддоменов{RESET}")
+    print(f"  Saved to     : {save_path}")
+    return normalized
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 2 — getJS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def step_getjs(input_file: str, threads: int = 50) -> list[str]:
@@ -435,7 +647,7 @@ def step_getjs(input_file: str, threads: int = 50) -> list[str]:
     Требуется: go install github.com/003random/getJS@latest
     """
     print(f"\n{'═'*72}")
-    print(f"{BOLD}  [1/5] getJS — collecting JS file URLs{RESET}")
+    print(f"{BOLD}  [2/6] getJS — collecting JS file URLs{RESET}")
     print(f"{'─'*72}")
     print(f"  Input  : {input_file}")
     print(f"  Threads: {threads}")
@@ -474,7 +686,7 @@ def step_getjs(input_file: str, threads: int = 50) -> list[str]:
     return js_urls
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — Merge & deduplicate
+# STEP 3 — Merge & deduplicate
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def step_merge(original_urls: list[str], js_urls: list[str], save_path: str) -> list[str]:
@@ -483,7 +695,7 @@ def step_merge(original_urls: list[str], js_urls: list[str], save_path: str) -> 
     Сохраняет результат в save_path для аудита.
     """
     print(f"\n{'═'*72}")
-    print(f"{BOLD}  [2/5] Merge — combining URL lists{RESET}")
+    print(f"{BOLD}  [3/6] Merge — combining URL lists{RESET}")
     print(f"{'─'*72}")
 
     combined = list(dict.fromkeys(original_urls + js_urls))
@@ -499,12 +711,12 @@ def step_merge(original_urls: list[str], js_urls: list[str], save_path: str) -> 
     return combined
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — Scan
+# STEP 4 — Scan
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def step_scan(urls: list[str], concurrency: int, severity: str) -> list[FileResult]:
     print(f"\n{'═'*72}")
-    print(f"{BOLD}  [3/5] Scan — searching for secrets{RESET}")
+    print(f"{BOLD}  [4/6] Scan — searching for secrets{RESET}")
     print(f"{'─'*72}")
     print(f"  URLs    : {len(urls)}")
     print(f"  Threads : {concurrency}")
@@ -555,7 +767,7 @@ async def step_scan(urls: list[str], concurrency: int, severity: str) -> list[Fi
     return list(results)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — Excel report
+# STEP 5 — Excel report
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def step_excel(results: list[FileResult], path: str) -> bool:
@@ -565,7 +777,7 @@ def step_excel(results: list[FileResult], path: str) -> bool:
     Лист "Summary":  scan metadata + счётчики по severity
     """
     print(f"\n{'═'*72}")
-    print(f"{BOLD}  [4/5] Excel — generating report{RESET}")
+    print(f"{BOLD}  [5/6] Excel — generating report{RESET}")
     print(f"{'─'*72}")
 
     try:
@@ -715,7 +927,7 @@ def step_excel(results: list[FileResult], path: str) -> bool:
     return True
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STEP 5 — AWS SES email
+# STEP 6 — AWS SES email
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def step_email(results: list[FileResult], excel_path: Optional[str] = None, json_path: Optional[str] = None):
@@ -725,7 +937,7 @@ def step_email(results: list[FileResult], excel_path: Optional[str] = None, json
     Требуется: pip install boto3 + настроенные AWS credentials
     """
     print(f"\n{'═'*72}")
-    print(f"{BOLD}  [5/5] Email — sending via AWS SES{RESET}")
+    print(f"{BOLD}  [6/6] Email — sending via AWS SES{RESET}")
     print(f"{'─'*72}")
     print(f"  From   : {SES_SENDER}")
     print(f"  To     : {SES_RECIPIENT}")
@@ -827,36 +1039,59 @@ def save_json(results: list[FileResult], path: str):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-async def main():
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "JS Security Analyzer — Full auto-pipeline\n"
-            "  --urls file.txt  →  getJS → merge → scan → Excel → SES email"
+            "  scan -f root.txt    →  SecurityTrails → getJS → merge → scan → Excel → SES email\n"
+            "  scan --urls file.txt →  getJS → merge → scan → Excel → SES email"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--urls", metavar="FILE", required=True,
-                        help="Файл с URL / доменами (один на строку)")
-    parser.add_argument("--concurrency", type=int, default=10,
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    scan_p = subparsers.add_parser(
+        "scan",
+        help="Запустить полный пайплайн (subdomains → getJS → merge → scan → excel → email)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    src = scan_p.add_mutually_exclusive_group(required=True)
+    src.add_argument("-f", "--roots", metavar="FILE",
+                      help="Файл с корневыми доменами (один на строку) — поддомены "
+                           "собираются автоматически через SecurityTrails")
+    src.add_argument("--urls", metavar="FILE",
+                      help="Файл с уже готовым списком URL / хостов (один на строку) — "
+                           "SecurityTrails не используется")
+
+    scan_p.add_argument("-k", "--st-api-key", default=None,
+                        help="API-ключ SecurityTrails (нужен только с -f/--roots; "
+                             "или задайте переменную окружения ST_API_KEY)")
+    scan_p.add_argument("--children-only", action="store_true",
+                        help="SecurityTrails: только прямые поддомены (без вложенных)")
+    scan_p.add_argument("--concurrency", type=int, default=10,
                         help="Параллельных HTTP запросов (default: 10)")
-    parser.add_argument("--severity", choices=[CRITICAL, HIGH, MEDIUM, LOW], default=LOW,
+    scan_p.add_argument("--severity", choices=[CRITICAL, HIGH, MEDIUM, LOW], default=LOW,
                         help="Минимальный severity (default: LOW)")
-    parser.add_argument("--getjs-threads", type=int, default=50,
+    scan_p.add_argument("--getjs-threads", type=int, default=50,
                         help="Потоки для getJS (default: 50)")
-    parser.add_argument("--no-getjs", action="store_true",
-                        help="Пропустить getJS, сканировать только --urls файл")
-    parser.add_argument("--no-email", action="store_true",
+    scan_p.add_argument("--no-getjs", action="store_true",
+                        help="Пропустить getJS, сканировать только исходный список")
+    scan_p.add_argument("--no-email", action="store_true",
                         help="Не отправлять письмо через SES")
-    parser.add_argument("--excel", metavar="FILE", default="findings.xlsx",
+    scan_p.add_argument("--excel", metavar="FILE", default="findings.xlsx",
                         help="Путь к Excel-отчёту (default: findings.xlsx)")
-    parser.add_argument("--json", metavar="FILE",
+    scan_p.add_argument("--json", metavar="FILE",
                         help="Дополнительно сохранить JSON-отчёт")
-    parser.add_argument("--email-domains", metavar="DOMAINS",
+    scan_p.add_argument("--email-domains", metavar="DOMAINS",
                         help="Опционально: искать email-адреса на указанных доменах "
                              "(через запятую, напр. temabit.com,foodtech.team). "
                              "По умолчанию поиск email отключён.")
 
-    args = parser.parse_args()
+    return parser
+
+async def main():
+    args = build_arg_parser().parse_args()
 
     if args.email_domains:
         domains = [d for d in args.email_domains.split(",") if d.strip()]
@@ -866,52 +1101,63 @@ async def main():
 
     precompile_patterns()  # один раз, до начала конкурентного сканирования
 
-    # Load original URL list and normalize
-    def normalize_url(raw: str) -> str:
-        """Ensure URL has scheme and at least '/' as path so the root is scanned."""
-        raw = raw.strip()
-        if not urlparse(raw).scheme:
-            raw = "https://" + raw
-        p = urlparse(raw)
-        # If no path at all, default to /
-        if not p.path:
-            raw = p._replace(path="/").geturl()
-        return raw
+    # ── Source of the initial host/URL list: -f/--roots (SecurityTrails) or --urls ──
+    if args.roots:
+        st_api_key = args.st_api_key or os.environ.get("ST_API_KEY")
+        if not st_api_key:
+            print("[!] Укажите API-ключ SecurityTrails через -k/--st-api-key "
+                  "или переменную окружения ST_API_KEY", file=sys.stderr)
+            sys.exit(1)
 
-    try:
-        with open(args.urls, encoding="utf-8") as fh:
-            original_urls = list(dict.fromkeys(
-                normalize_url(l) for l in fh if l.strip() and not l.startswith("#")
-            ))
-    except FileNotFoundError:
-        print(f"[!] Файл не найден: {args.urls}")
-        sys.exit(1)
+        base = os.path.splitext(args.roots)[0]
+        subdomains_path = f"{base}_subdomains.txt"
+        # step_subdomains() уже нормализует хосты (добавляет схему) — см.
+        # комментарий у normalize_url() про то, почему это обязательно для getJS.
+        original_urls = step_subdomains(args.roots, st_api_key, args.children_only, subdomains_path)
+        if not original_urls:
+            print("[!] SecurityTrails не вернул ни одного поддомена.")
+            sys.exit(1)
+        input_label = args.roots
+        input_for_getjs = subdomains_path
+    else:
+        try:
+            with open(args.urls, encoding="utf-8") as fh:
+                original_urls = list(dict.fromkeys(
+                    normalize_url(l) for l in fh if l.strip() and not l.startswith("#")
+                ))
+        except FileNotFoundError:
+            print(f"[!] Файл не найден: {args.urls}")
+            sys.exit(1)
+        input_label = args.urls
+        input_for_getjs = args.urls
+        print(f"\n  {'─'*70}")
+        print(f"  [1/6] SecurityTrails — {DIM}skipped (no -f/--roots){RESET}")
 
     if not original_urls:
-        print("[!] Файл пустой.")
+        print("[!] Список хостов пуст.")
         sys.exit(1)
 
     print(f"\n  {'═'*70}")
     print(f"  {BOLD}JS Security Analyzer — Full Pipeline{RESET}")
     print(f"  Started : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  Input   : {args.urls}  ({len(original_urls)} URLs)")
+    print(f"  Input   : {input_label}  ({len(original_urls)} hosts)")
     print(f"  Output  : {args.excel}")
     print(f"  Email   : {'disabled (--no-email)' if args.no_email else SES_RECIPIENT}")
     print(f"  {'═'*70}")
 
-    # ── Step 1: getJS ─────────────────────────────────────────────────────────
+    # ── Step 2: getJS ─────────────────────────────────────────────────────────
     js_urls: list[str] = []
     if not args.no_getjs:
-        js_urls = step_getjs(args.urls, threads=args.getjs_threads)
+        js_urls = step_getjs(input_for_getjs, threads=args.getjs_threads)
     else:
-        print(f"\n  [1/5] getJS — {DIM}skipped (--no-getjs){RESET}")
+        print(f"\n  [2/6] getJS — {DIM}skipped (--no-getjs){RESET}")
 
-    # ── Step 2: merge ─────────────────────────────────────────────────────────
-    base      = os.path.splitext(args.urls)[0]
+    # ── Step 3: merge ─────────────────────────────────────────────────────────
+    base        = os.path.splitext(input_label)[0]
     merged_path = f"{base}_scan_targets.txt"
-    scan_urls = step_merge(original_urls, js_urls, merged_path)
+    scan_urls   = step_merge(original_urls, js_urls, merged_path)
 
-    # ── Step 3: scan ──────────────────────────────────────────────────────────
+    # ── Step 4: scan ──────────────────────────────────────────────────────────
     results = await step_scan(scan_urls, args.concurrency, args.severity)
 
     # Summary
@@ -928,14 +1174,14 @@ async def main():
     print(f"  {SEVERITY_COLOR[CRITICAL]}⚠ With findings : {count_hits}  ({total_findings} total){RESET}")
     print(f"  {DIM}✗ Fetch errors   : {count_errors}{RESET}")
 
-    # ── Step 4: Excel ─────────────────────────────────────────────────────────
+    # ── Step 5: Excel ─────────────────────────────────────────────────────────
     excel_ok = step_excel(results, args.excel)
 
     # ── Optional: JSON ────────────────────────────────────────────────────────
     if args.json:
         save_json(results, args.json)
 
-    # ── Step 5: email ─────────────────────────────────────────────────────────
+    # ── Step 6: email ─────────────────────────────────────────────────────────
     if not args.no_email:
         step_email(
             results,
@@ -943,7 +1189,7 @@ async def main():
             json_path  = args.json  if args.json  else None,
         )
     else:
-        print(f"\n  [5/5] Email — {DIM}skipped (--no-email){RESET}")
+        print(f"\n  [6/6] Email — {DIM}skipped (--no-email){RESET}")
 
     print(f"\n{'═'*72}")
     print(f"{BOLD}  Done. {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
