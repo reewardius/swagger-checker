@@ -1,4 +1,5 @@
 # python3 swagger_checker.py -i swagger_endpoints.txt -t 100 --jwt-test
+# python3 swagger_checker.py -t 100 --jwt-test
 
 import requests
 import json
