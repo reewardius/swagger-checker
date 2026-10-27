@@ -1,19 +1,21 @@
 id: swagger-api
 
 info:
-  name: Public Swagger API - Detect
+  name: Public Swagger/OpenAPI - Detect
   author: pdteam,c-sh0,AmirHossein Raeisi
   severity: info
-  description: Public Swagger API was detected.
-  reference: https://swagger.io/
+  description: Public Swagger/OpenAPI documentation endpoint was detected.
+  reference:
+    - https://swagger.io/
+    - https://spec.openapis.org/
   classification:
     cvss-metrics: CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N
     cwe-id: CWE-200
   metadata:
     verified: true
-    max-request: 59
+    max-request: 92
     shodan-query: "http.title:\"swagger\""
-  tags: exposure,api,swagger
+  tags: exposure,api,swagger,openapi
 
 http:
   - method: GET
@@ -22,6 +24,7 @@ http:
 
     payloads:
       paths:
+        # --- Swagger UI / JS ---
         - "/swagger-ui/swagger-ui.js"
         - "/swagger/swagger-ui.js"
         - "/swagger-ui.js"
@@ -30,7 +33,15 @@ http:
         - "/swagger/index.html"
         - "/swagger-ui.html"
         - "/swagger/swagger-ui.html"
+        - "/swagger-ui/index.html"
         - "/api/swagger-ui.html"
+        - "/swagger-ui/springfox.js"
+        - "/swagger-ui/swagger-ui-standalone-preset.js"
+        - "/swagger-ui/swagger-ui/swagger-ui-bundle.js"
+        - "/swagger-ui-dist/swagger-ui-bundle.js"
+        - "/webjars/swagger-ui/swagger-ui-bundle.js"
+        - "/webjars/swagger-ui/index.html"
+        # --- Swagger spec (generic) ---
         - "/api-docs/swagger.json"
         - "/api-docs/swagger.yaml"
         - "/api_docs"
@@ -38,53 +49,80 @@ http:
         - "/swagger.yaml"
         - "/swagger/v1/swagger.json"
         - "/swagger/v1/swagger.yaml"
+        - "/swagger/v2/swagger.json"
+        # --- .NET (Swashbuckle / NSwag, legacy) ---
+        - "/swagger/docs/v1"
+        - "/swagger/docs/v2"
+        # --- /api/* variants ---
         - "/api/index.html"
         - "/api/doc"
+        - "/api/doc.json"
         - "/api/docs/"
+        - "/api/docs-json"
         - "/api/swagger.json"
         - "/api/swagger.yaml"
         - "/api/swagger.yml"
+        - "/api/swagger_doc.json"
         - "/api/swagger/index.html"
         - "/api/swagger/swagger-ui.html"
+        - "/api/swagger/static/index.html"
+        - "/api/swagger/ui/index"
+        - "/api/swagger"
+        - "/api/api-docs"
         - "/api/api-docs/swagger.json"
         - "/api/api-docs/swagger.yaml"
         - "/api/swagger-ui/swagger.json"
         - "/api/swagger-ui/swagger.yaml"
+        - "/api/swagger-ui/api-docs"
+        - "/api/apidocs"
         - "/api/apidocs/swagger.json"
         - "/api/apidocs/swagger.yaml"
-        - "/api/swagger-ui/api-docs"
-        - "/api/doc.json"
-        - "/api/api-docs"
-        - "/api/apidocs"
-        - "/api/swagger"
-        - "/api/swagger/static/index.html"
-        - "/api/swagger-resources"
-        - "/api/swagger-resources/restservices/v2/api-docs"
-        - "/api/__swagger__/"
-        - "/api/_swagger_/"
         - "/api/spec/swagger.json"
         - "/api/spec/swagger.yaml"
-        - "/api/swagger/ui/index"
-        - "/__swagger__/"
-        - "/_swagger_/"
+        - "/api/__swagger__/"
+        - "/api/_swagger_/"
         - "/api/v1/swagger.json"
         - "/api/v2/swagger.json"
         - "/api/v3/swagger.json"
         - "/api/v1/swagger-ui/swagger.json"
         - "/api/v1/swagger-ui/swagger.yaml"
+        - "/api/documentation"
+        # --- swagger-resources (Springfox) ---
         - "/swagger-resources/restservices/v2/api-docs"
-        - "/api/swagger_doc.json"
+        - "/swagger-resources/configuration/ui"
+        - "/swagger-resources/configuration/security"
+        - "/api/swagger-resources"
+        - "/api/swagger-resources/restservices/v2/api-docs"
+        # --- Spring api-docs (Springfox/Springdoc) ---
+        - "/v2/api-docs"
+        - "/v3/api-docs"
+        - "/v3/api-docs.yaml"
+        - "/v3/api-docs/swagger-config"
+        - "/api/v2/api-docs"
+        - "/api/v3/api-docs"
+        # --- OpenAPI 3.x (FastAPI, generic) ---
+        - "/openapi.json"
+        - "/openapi.yaml"
+        - "/openapi.yml"
+        - "/api/openapi.json"
+        - "/api/openapi.yaml"
+        - "/v1/openapi.json"
+        - "/redoc"
+        # --- short / root paths ---
+        - "/__swagger__/"
+        - "/_swagger_/"
         - "/docu"
         - "/docs"
         - "/docs/"
+        - "/doc/"
         - "/swagger"
         - "/api-doc"
-        - "/doc/"
-        - "/swagger-ui/springfox.js"
-        - "/swagger-ui/swagger-ui-standalone-preset.js"
-        - "/swagger-ui/swagger-ui/swagger-ui-bundle.js"
-        - "/webjars/swagger-ui/swagger-ui-bundle.js"
-        - "/webjars/swagger-ui/index.html"
+        - "/apidocs"
+        - "/apidocs/"
+        - "/documentation"
+        - "/documentation/swagger.json"
+        - "/rest/api-docs"
+        - "/explorer/"
         - "/developers/documentation"
 
     headers:
@@ -100,8 +138,10 @@ http:
           - "\"swagger\":"
           - "Swagger UI"
           - "loadSwaggerUI"
-          - "**token**:"
           - "id=\"swagger-ui"
+          - "\"openapi\":"
+          - "openapi:"
+          - "Redoc"
         condition: or
 
       - type: status
@@ -114,4 +154,3 @@ http:
         group: 1
         regex:
           - " @version (v[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3})"
-# digest: 4b0a004830460221009b9f635954985aa3ec4b9adf63036b03804ea8e1574c05f5d52661232b6ab654022100e342acdfdac142cfe29f08db5e3247ee59f4e6b92c34ce9f77559e9cfdb8de30:922c64590222798bb761d5b6d8e72950
