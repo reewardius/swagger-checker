@@ -380,9 +380,9 @@ def is_trivial(value: str) -> bool:
     if re.match(r'^[a-z_]+$', v): return True
 
     # ── Minified JS false-positive filters ───────────────────────────────────
-    # Только цифры (error/status-коды вроде 80041012, ID) — не секрет.
-    # Цена: цифровые PIN длиной ≥ 6 тоже отфильтруются.
-    if re.fullmatch(r'\d{6,}', v): return True
+    # Только цифры (error/status-коды вроде 80041012, -17005, ID) — не секрет.
+    # Цена: цифровые PIN длиной ≥ 5 тоже отфильтруются.
+    if re.fullmatch(r'-?\d{5,}', v): return True
     # JS punctuation that cannot appear in a real credential
     if re.search(r'[(){}\[\];!?]', v): return True
     # Запятая и двоеточие по краю — признак минифицированного фрагмента кода
