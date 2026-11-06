@@ -119,8 +119,10 @@ PATTERNS: list[tuple[str, str, str]] = [
      r'[Bb]earer\s+([A-Za-z0-9_\-\.~+/]{20,})'),
     (HIGH, "API Key / Token Field",
      r'(?:auth[_-]?token|access[_-]?token|refresh[_-]?token|api[_-]?token)\s*[=:]\s*["\']([A-Za-z0-9_\-\.]{16,})["\']'),
+    # Lookbehind вместо \b: ловит "auth_eyJ..." и "x:eyJ..." (\b ломался на "_").
+    # Подпись с * — ловит unsigned JWT (alg=none, пустая подпись "h.p.").
     (HIGH, "API Key / Raw JWT Token",
-     r'\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b'),
+     r'(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*'),
 
     # Databases
     (CRITICAL, "Database / Connection String with Credentials",
@@ -224,6 +226,63 @@ PATTERNS: list[tuple[str, str, str]] = [
     # Communications
     (HIGH, "Cloud / Discord Bot Token",
      r'\b[MN][A-Za-z\d_-]{23}\.[A-Za-z\d_-]{6}\.[A-Za-z\d_-]{27}\b'),
+
+    # ── Payments (префиксы/формат специфичные → низкий FP) ───────────────────
+    (CRITICAL, "Payment / Stripe Webhook Signing Secret",
+     r'\bwhsec_[A-Za-z0-9]{32,}\b'),
+    (CRITICAL, "Payment / Stripe Restricted Live Key",
+     r'\brk_live_[A-Za-z0-9]{24,}\b'),
+    (CRITICAL, "Payment / Checkout.com Secret Key",
+     r'\bsk_(?:test|live)_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b'),
+    (CRITICAL, "Payment / Razorpay Live Key Secret",
+     r'\brzp_live_[A-Za-z0-9]{14}\b'),
+    (HIGH, "Payment / Mollie Live API Key",
+     r'\blive_(?=[A-Za-z0-9]*\d)(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{30}\b'),
+    (CRITICAL, "Payment / Plaid Access Token",
+     r'\baccess-(?:sandbox|development|production)-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b'),
+    # Провайдеры без стабильного префикса (PayPal, LiqPay, WayForPay, Monobank,
+    # Portmone, Fondy, Adyen, Paddle, Klarna): имя провайдера + "secret/private"
+    # рядом с присваиванием, значение обязано содержать и цифру, и букву.
+    (HIGH, "Payment / Provider Secret by Context",
+     r'(?i)\b(?:liqpay|wayforpay|fondy|monobank|portmone|paypal|braintree|adyen|checkout|mollie|paddle|klarna)[\w-]{0,20}'
+     r'(?:private[_-]?key|secret[_-]?key|secret|private)[\w-]{0,10}["\']?\s*[:=]\s*'
+     r'["\']((?=[^"\'\s]*\d)(?=[^"\'\s]*[A-Za-z])[A-Za-z0-9_\-+/=]{16,})["\']'),
+
+    # ── Password / credentials (сужено: кавычки + цифра и буква в значении) ──
+    (CRITICAL, "Password / Quoted JSON Key",
+     r'["\'](?:password|passwd|pwd|client_?secret|api_?key|apikey)["\']\s*:\s*'
+     r'["\']((?=[^"\'\s]*\d)(?=[^"\'\s]*[A-Za-z])[^"\'\s]{6,})["\']'),
+    (HIGH, "Password / URL Query Parameter",
+     r'[?&](?:password|passwd|access_token|api_?key|client_?secret)='
+     r'((?=[^&\s"\'`]*\d)(?=[^&\s"\'`]*[A-Za-z])[^&\s"\'`]{12,})'),
+    (CRITICAL, "Password / .NET Connection String",
+     r'(?i)(?:password|pwd)\s*=\s*((?=[^;"\'\s]*\d)(?=[^;"\'\s]*[A-Za-z])[^;"\'\s]{6,});'),
+    (CRITICAL, "Password / JDBC URL Credentials",
+     r'jdbc:[a-z0-9]+://[^\s"\']*[?;&](?:password|pwd)=([^&;\s"\']+)'),
+
+    # ── Cloud / SaaS токены с фиксированным префиксом ────────────────────────
+    (HIGH, "Cloud / Supabase Access Token",
+     r'\bsbp_[a-f0-9]{40}\b'),
+    (HIGH, "Cloud / Doppler Token",
+     r'\bdp\.(?:pt|st|sa|ct)\.[A-Za-z0-9]{40,}'),
+    (HIGH, "AI / Hugging Face Token",
+     r'\bhf_[A-Za-z0-9]{34}\b'),
+    (HIGH, "AI / Groq API Key",
+     r'\bgsk_[A-Za-z0-9]{52}\b'),
+    (HIGH, "Cloud / Shopify App Token",
+     r'\bshp(?:ca|pa|ss)_[a-fA-F0-9]{32}\b'),
+    (HIGH, "Cloud / Slack App-Level Token",
+     r'\bxapp-\d-[A-Z0-9]+-\d+-[a-z0-9]+'),
+
+    # ── Webhooks (позволяют писать в внутренние каналы) ──────────────────────
+    (HIGH, "Cloud / Discord Webhook",
+     r'https://discord(?:app)?\.com/api/webhooks/\d{17,20}/[A-Za-z0-9_\-]{60,}'),
+    (HIGH, "Cloud / Microsoft Teams Webhook",
+     r'https://[a-z0-9]+\.webhook\.office\.com/webhookb2/[A-Za-z0-9@\-/]{60,}'),
+
+    # ── Azure SAS: требуем sv=<версия> рядом с sig= (не любой ?sig=) ─────────
+    (HIGH, "Cloud / Azure SAS Signature",
+     r'\bsv=\d{4}-\d{2}-\d{2}[^"\'\s]*?&sig=([A-Za-z0-9%+/=]{20,})'),
 ]
 
 # ─── Email / internal-domain patterns (opt-in via --email-domains) ────────────
@@ -257,7 +316,7 @@ def build_email_patterns(domains: list[str]) -> list[tuple[str, str, str]]:
 # в is_trivial() (чтобы не отбрасывать JWT как минифицированный JS-код),
 # и в analyze_content() (чтобы generic-паттроны типа "Token Field" / "Bearer
 # Token" не дублировали находку, которую уже покрывает "Raw JWT Token").
-_JWT_FULL_RE = re.compile(r'^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$')
+_JWT_FULL_RE = re.compile(r'^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$')
 
 IGNORE_SUBSTRINGS = {
     'undefined', 'null', 'true', 'false', 'none', 'empty', 'placeholder',
@@ -289,8 +348,14 @@ def is_trivial(value: str) -> bool:
         'NRAK-', 'sq0atp-', 'sq0csp-',
         'github_pat_', 'glpat-', 'PMAK-', 'GOCSPX-', 'secret_', 'sntrys_',
         'lin_api_', 'EAA', 'AAAAAAAAAAAAAAAAAAAAA',
+        # new: payments / SaaS (специфичные префиксы, обходят фильтры)
+        'whsec_', 'rk_live_', 'rzp_live_', 'access-sandbox-', 'access-development-',
+        'access-production-', 'sbp_', 'dp.pt.', 'dp.st.', 'dp.sa.', 'dp.ct.',
+        'gsk_', 'shpca_', 'shppa_', 'shpss_', 'xapp-',
     )
     if any(v.startswith(p) for p in SAFE_PREFIXES): return False
+    # Webhook URLs содержат "discord.com"/"office.com"/"slack.com" → иначе ловит фильтр "\w\.\w"
+    if re.match(r'^https://(?:discord(?:app)?\.com/api/webhooks/|hooks\.slack\.com/services/|[a-z0-9]+\.webhook\.office\.com/webhookb2/)', v): return False
     # Raw JWT (header.payload.signature, header/payload are base64 JSON → start with "eyJ")
     if _JWT_FULL_RE.match(v): return False
     # Discord bot token (contains dots, would otherwise hit the JS-expression filter below)
@@ -315,6 +380,10 @@ def is_trivial(value: str) -> bool:
     # ── Minified JS false-positive filters ───────────────────────────────────
     # JS punctuation that cannot appear in a real credential
     if re.search(r'[(){}\[\];!?]', v): return True
+    # Запятая и двоеточие по краю — признак минифицированного фрагмента кода
+    # (",dataref:", "a,b:c"), а не секрета. Запятую внутри значения тоже считаем
+    # мусором для generic-правил; реальные пароли с запятой могут отфильтроваться.
+    if ',' in v or v.startswith(':') or v.endswith(':'): return True
     # JS expressions: word.word(), ternary ?word
     if re.search(r'\w\.\w|\w\(|\?\w', v): return True
     # High ratio of chars that don't appear in real secrets
@@ -369,7 +438,7 @@ def get_compiled_patterns() -> list[tuple[str, str, "re.Pattern"]]:
 # его payload прогоняется через ВСЕ активные паттерны (включая --email-domains).
 
 _JWT_STRUCTURE_RE = re.compile(
-    r'\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b'
+    r'(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*'
 )
 
 def _b64url_decode(segment: str) -> Optional[str]:
@@ -442,6 +511,65 @@ def scan_basic_auth(content: str) -> list[Finding]:
             ))
     return extra
 
+# ── Docker registry credentials: decode-and-verify (низкий FP) ──────────────
+# Сам base64 без контекста — шум, поэтому находка только если декодированное
+# значение реально имеет вид "user:password" (или JSON с "auths" для k8s).
+
+_DOCKER_AUTH_RE = re.compile(r'"auth"\s*:\s*"([A-Za-z0-9+/=]{16,})"')
+_DOCKER_CFG_RE  = re.compile(r'dockerconfigjson["\']?\s*:\s*["\']([A-Za-z0-9+/=]{40,})["\']')
+
+def _b64_decode_strict(token: str) -> Optional[str]:
+    padded = token + "=" * (-len(token) % 4)
+    try:
+        return base64.b64decode(padded, validate=True).decode("utf-8")
+    except Exception:
+        return None
+
+def _user_pass_or_none(decoded: Optional[str]) -> Optional[str]:
+    if not decoded or ":" not in decoded or " " in decoded:
+        return None
+    user, pw = decoded.split(":", 1)
+    if not user or is_trivial(pw):
+        return None
+    return decoded
+
+def scan_docker_auth(content: str) -> list[Finding]:
+    extra: list[Finding] = []
+    for line_num, line in enumerate(content.splitlines(), start=1):
+        for m in _DOCKER_AUTH_RE.finditer(line):
+            creds = _user_pass_or_none(_b64_decode_strict(m.group(1)))
+            if creds:
+                extra.append(Finding(
+                    severity=HIGH,
+                    category="Cloud / Docker Registry Auth (decoded)",
+                    match=creds[:250],
+                    line_number=line_num,
+                    line_content=line.strip()[:350],
+                ))
+        for m in _DOCKER_CFG_RE.finditer(line):
+            raw = _b64_decode_strict(m.group(1))
+            try:
+                cfg = json.loads(raw) if raw else None
+            except json.JSONDecodeError:
+                cfg = None
+            if not isinstance(cfg, dict) or not isinstance(cfg.get("auths"), dict):
+                continue
+            for registry, entry in cfg["auths"].items():
+                if not isinstance(entry, dict):
+                    continue
+                creds = _user_pass_or_none(_b64_decode_strict(entry.get("auth", "")))
+                if not creds and entry.get("password") and not is_trivial(entry["password"]):
+                    creds = f"{entry.get('username', '')}:{entry['password']}"
+                if creds:
+                    extra.append(Finding(
+                        severity=HIGH,
+                        category="Cloud / Docker Registry Auth (k8s dockerconfigjson)",
+                        match=f"{registry} | {creds}"[:250],
+                        line_number=line_num,
+                        line_content=line.strip()[:350],
+                    ))
+    return extra
+
 def analyze_content(content: str, min_severity: str) -> list[Finding]:
     findings: list[Finding] = []
     lines = content.splitlines()
@@ -477,6 +605,8 @@ def analyze_content(content: str, min_severity: str) -> list[Finding]:
 
     findings.extend(scan_jwt_payloads(content, min_order))
     findings.extend(scan_basic_auth(content))
+    if SEVERITY_ORDER[HIGH] <= min_order:
+        findings.extend(scan_docker_auth(content))
 
     seen: set[tuple] = set()
     unique: list[Finding] = []
