@@ -19,6 +19,7 @@ import json
 import logging
 import re
 import shutil
+import uuid
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -482,6 +483,26 @@ def origins_for(js_url: str, origin: str, target_host: str, scope_enforced: bool
     return sorted(origins)
 
 
+WEBPACK_PREFIX_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:/*")
+
+
+def candidate_source_urls(name: str, map_url: str, js_url: str) -> List[str]:
+    """
+    Для имён вида webpack:///./src/App/app.tsx самой адреса нет, но файл иногда
+    лежит в корне сайта или рядом с картой. Возвращает до 3 кандидатов.
+    Пути node_modules пропускаются.
+    """
+    path = WEBPACK_PREFIX_RE.sub("", name).split("?", 1)[0].split("#", 1)[0]
+    while path.startswith(("./", "../")):
+        path = path.split("/", 1)[1] if "/" in path else ""
+    path = path.lstrip("/")
+    if not path or "node_modules" in path.split("/"):
+        return []
+    candidates = [f"{origin_of(js_url)}/{path}", urljoin(map_url, path)]
+    return list(dict.fromkeys(
+        c for c in candidates if urlparse(c).scheme in ("http", "https")))[:3]
+
+
 async def load_sourcemap_docs(
     session: aiohttp.ClientSession,
     ref: str,
@@ -509,15 +530,20 @@ async def load_sourcemap_docs(
         return []
 
     docs: List[Doc] = []
-    to_fetch: List[Tuple[str, str]] = []
+    to_fetch: List[Tuple[List[str], str]] = []
+    map_url = ref if not ref.startswith("data:") else js_url
     for name, content in entries:
         via = f"{ref} :: {name}"
         if content:
             docs.append(Doc(js_url, via, content, origins))
             continue
-        url = source_fetch_url(ref if not ref.startswith("data:") else js_url, name)
+        url = source_fetch_url(map_url, name)
         if url:
-            to_fetch.append((url, via))
+            to_fetch.append(([url], via))
+            continue
+        candidates = candidate_source_urls(name, map_url, js_url)   # webpack:/// и т.п.
+        if candidates:
+            to_fetch.append((candidates, via))
 
     if len(to_fetch) > args.max_sources:
         log.info("  [map] %d source files, fetching first %d (--max-sources)",
@@ -529,18 +555,193 @@ async def load_sourcemap_docs(
 
     sem = asyncio.Semaphore(args.threads)
 
-    async def get(url: str, via: str):
+    async def get(urls: List[str], via: str):
         async with sem:
-            return via, await fetch_text(session, url, args.timeout, auth, target_host,
-                                         False, MAX_JS_BYTES)
+            for url in urls:
+                text = await fetch_text(session, url, args.timeout, auth, target_host,
+                                        False, MAX_JS_BYTES)
+                if not text:
+                    continue
+                if text.lstrip()[:20].lower().startswith(("<!doctype", "<html")):
+                    continue                      # SPA fallback page, not source code
+                return via, text
+            return via, None
 
     for via, text in await asyncio.gather(*(get(u, v) for u, v in to_fetch)):
-        if not text:
-            continue
-        if text.lstrip()[:20].lower().startswith(("<!doctype", "<html")):
-            continue                              # SPA fallback page, not source code
-        docs.append(Doc(js_url, via, text, origins))
+        if text:
+            docs.append(Doc(js_url, via, text, origins))
     return docs
+
+
+# ─── Cloud storage: Firebase / S3 / GCS / Azure Blob ──────────────────────────
+# Облачные ресурсы из JS и source maps. Проверки без авторизации (чужие креды
+# никуда не уходят): LIST и READ всегда, WRITE только с --check-cloud-write.
+
+FIREBASE_RE = re.compile(
+    r"https://([a-z0-9][a-z0-9-]{0,61}\.firebaseio\.com"
+    r"|[a-z0-9][a-z0-9-]{0,61}\.[a-z0-9-]{1,40}\.firebasedatabase\.app)(?![a-z0-9-])",
+    re.IGNORECASE)
+S3_VHOST_RE = re.compile(
+    r"https?://([a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]\.s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com)(?![a-z0-9-])"
+    r"(?:/([^\s\"'`<>?#]*))?", re.IGNORECASE)
+S3_PATH_RE = re.compile(
+    r"https?://s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com/([a-z0-9][a-z0-9.\-]{1,61}[a-z0-9])"
+    r"(?:/([^\s\"'`<>?#]*))?", re.IGNORECASE)
+GCS_PATH_RE = re.compile(
+    r"https?://storage\.googleapis\.com/([a-z0-9][a-z0-9._\-]{1,61}[a-z0-9])"
+    r"(?:/([^\s\"'`<>?#]*))?", re.IGNORECASE)
+GCS_VHOST_RE = re.compile(
+    r"https?://([a-z0-9][a-z0-9._\-]{1,61}[a-z0-9])\.storage\.googleapis\.com(?![a-z0-9-])"
+    r"(?:/([^\s\"'`<>?#]*))?", re.IGNORECASE)
+AZURE_RE = re.compile(
+    r"https?://([a-z0-9]{3,24})\.blob\.core\.windows\.net/([a-z0-9][a-z0-9-]{1,61}[a-z0-9])"
+    r"(?:/([^\s\"'`<>?#]*))?", re.IGNORECASE)
+CLOUD_WRITE_OK = {"s3": (200,), "gcs": (200,), "azure": (201,), "firebase": (200,)}
+
+
+def _clean_key(key: Optional[str]) -> Optional[str]:
+    """Ключ объекта из JS. Шаблоны вида ${x} или {x} — не ключ, пропускаем."""
+    if not key or re.search(r"[{}$]", key):
+        return None
+    return key.strip("/") or None
+
+
+def extract_cloud_resources(content: str) -> List[Tuple[str, str, Optional[str]]]:
+    """Возвращает [(kind, root, key)]. root — базовый URL, к нему дописываются пути."""
+    out: List[Tuple[str, str, Optional[str]]] = []
+    for m in FIREBASE_RE.finditer(content):
+        out.append(("firebase", f"https://{m.group(1)}", None))
+    for m in S3_VHOST_RE.finditer(content):
+        out.append(("s3", f"https://{m.group(1)}", _clean_key(m.group(2))))  # host уже с регионом
+    for m in S3_PATH_RE.finditer(content):
+        out.append(("s3", f"https://s3.amazonaws.com/{m.group(1)}", _clean_key(m.group(2))))
+    for m in GCS_PATH_RE.finditer(content):
+        out.append(("gcs", f"https://storage.googleapis.com/{m.group(1)}", _clean_key(m.group(2))))
+    for m in GCS_VHOST_RE.finditer(content):
+        out.append(("gcs", f"https://{m.group(1)}.storage.googleapis.com", _clean_key(m.group(2))))
+    for m in AZURE_RE.finditer(content):
+        out.append(("azure", f"https://{m.group(1)}.blob.core.windows.net/{m.group(2)}",
+                    _clean_key(m.group(3))))
+    return out
+
+
+def _data_ok(status: Optional[int], body: bytes) -> bool:
+    """200 с содержимым, а не пустой ответ, null или XML/JSON-ошибка."""
+    if status != 200:
+        return False
+    stripped = body.strip()
+    if not stripped or stripped == b"null":
+        return False
+    return not stripped.startswith((b"<Error>", b'{"error"'))
+
+
+async def _cloud_req(session: aiohttp.ClientSession, method: str, url: str, timeout: int,
+                     body: Optional[bytes] = None,
+                     headers: Optional[Dict[str, str]] = None) -> Optional[Tuple[int, str, bytes]]:
+    try:
+        async with session.request(method, url, data=body, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=timeout),
+                                   allow_redirects=False) as resp:
+            data = await resp.content.read(MAX_PROBE_BYTES)
+            ct = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            return resp.status, ct, data
+    except Exception as e:
+        log.debug("cloud %s %s: %s", method, url, e)
+        return None
+
+
+async def _cloud_write_probe(session: aiohttp.ClientSession, kind: str, root: str, source_js: str,
+                             via: str, timeout: int) -> List[Hit]:
+    """Пишет тестовый объект с уникальным именем и сразу удаляет его."""
+    probe_id = uuid.uuid4().hex
+    headers: Dict[str, str] = {}
+    if kind == "firebase":
+        url = f"{root}/easm_probe/{probe_id}.json"
+        body = b'"easm-write-probe"'
+        headers["Content-Type"] = "application/json"
+    else:
+        url = f"{root}/easm-write-probe-{probe_id}.txt"
+        body = b"easm write probe (authorized check, deleted right after)"
+        headers["Content-Type"] = "text/plain"
+        if kind == "azure":
+            headers["x-ms-blob-type"] = "BlockBlob"
+
+    got = await _cloud_req(session, "PUT", url, timeout, body=body, headers=headers)
+    if not got or got[0] not in CLOUD_WRITE_OK[kind]:
+        return []
+    hit = Hit("WRITE", got[0], got[1], len(body), url, source_js, False, via)
+    log.info("    [+] HIT WRITE %s", url)
+
+    deleted = await _cloud_req(session, "DELETE", url, timeout)
+    if not deleted or deleted[0] not in (200, 202, 204):
+        status = deleted[0] if deleted else "нет ответа"
+        log.warning("    [!] тестовый объект НЕ удалён, удали вручную: %s (ответ: %s)", url, status)
+    return [hit]
+
+
+async def check_cloud_root(session: aiohttp.ClientSession, kind: str, root: str, keys: List[str],
+                           source_js: str, via: str, timeout: int, check_write: bool) -> List[Hit]:
+    hits: List[Hit] = []
+
+    # LIST и READ по корню (без авторизации)
+    if kind == "firebase":
+        list_url, list_ok = f"{root}/.json?shallow=true", _data_ok
+        read_targets = [(f"{root}/.json", _data_ok)]
+    elif kind == "azure":
+        list_url, list_ok = f"{root}?restype=container&comp=list", \
+            (lambda st, b: st == 200 and b"<EnumerationResults" in b)
+        read_targets = []
+    else:  # s3, gcs
+        list_url, list_ok = f"{root}/?max-keys=10", \
+            (lambda st, b: st == 200 and b"<ListBucketResult" in b)
+        read_targets = []
+
+    for key in keys:
+        read_targets.append((f"{root}/{key}", _data_ok))
+
+    got = await _cloud_req(session, "GET", list_url, timeout)
+    if got and list_ok(got[0], got[2]):
+        log.info("    [+] HIT LIST %s", list_url)
+        hits.append(Hit("LIST", got[0], got[1], len(got[2]), list_url, source_js, False, via))
+
+    for url, ok in read_targets:
+        got = await _cloud_req(session, "GET", url, timeout)
+        if got and ok(got[0], got[2]):
+            log.info("    [+] HIT READ %s", url)
+            hits.append(Hit("READ", got[0], got[1], len(got[2]), url, source_js, False, via))
+
+    if check_write:
+        hits += await _cloud_write_probe(session, kind, root, source_js, via, timeout)
+    return hits
+
+
+def collect_cloud_roots(docs: List["Doc"]) -> Dict[Tuple[str, str], Dict[str, object]]:
+    """Группирует облачные ресурсы по (kind, root): ключи объектов и первый источник."""
+    roots: Dict[Tuple[str, str], Dict[str, object]] = {}
+    for doc in docs:
+        try:
+            found = extract_cloud_resources(doc.content)
+        except Exception as e:
+            log.warning("  cloud extraction failed for %s: %s", doc.js_url, e)
+            continue
+        for kind, root, key in found:
+            g = roots.setdefault((kind, root), {"keys": [], "source": doc.js_url, "via": doc.via})
+            if key and key not in g["keys"]:
+                g["keys"].append(key)
+    return roots
+
+
+async def run_cloud_checks(session: aiohttp.ClientSession, roots: Dict, args: argparse.Namespace) -> List[Hit]:
+    sem = asyncio.Semaphore(args.threads)
+
+    async def one(item):
+        (kind, root), g = item
+        async with sem:
+            return await check_cloud_root(session, kind, root, g["keys"], g["source"], g["via"],
+                                          args.timeout, args.check_cloud_write)
+
+    results = await asyncio.gather(*(one(item) for item in roots.items()))
+    return [h for hs in results for h in hs]
 
 
 async def process_target(target: str, js_urls: List[str], args: argparse.Namespace) -> List[Hit]:
@@ -595,6 +796,15 @@ async def process_target(target: str, js_urls: List[str], args: argparse.Namespa
             docs += await load_sourcemap_docs(session, ref, js_url, origins, target_host,
                                               auth, scope_enforced, args)
 
+        # 2b. корень домена (/): HTML нужен только для поиска облачных ресурсов
+        html_docs: List[Doc] = []
+        if not args.no_cloud:
+            root_url = origin + "/"
+            html = await fetch_text(session, root_url, args.timeout, auth, target_host,
+                                    scope_enforced, MAX_JS_BYTES)
+            if html:
+                html_docs.append(Doc(root_url, "html /", html, [origin]))
+
         # 3. extract endpoints from every document
         endpoints: Dict[str, Endpoint] = {}
         for doc in docs:
@@ -622,16 +832,27 @@ async def process_target(target: str, js_urls: List[str], args: argparse.Namespa
             if scope_enforced and not in_scope(ep.url, target_host):
                 log.debug("  out of scope, not probed: %s (from %s)", ep.url, ep.source_js)
 
+        # облачные ресурсы из тех же документов (Firebase, S3, GCS, Azure)
+        cloud_roots: Dict = {} if args.no_cloud else collect_cloud_roots(docs + html_docs)
+        if cloud_roots:
+            log.info("Cloud resources: %d root(s)", len(cloud_roots))
+
         if args.no_probe:
-            return [Hit("-", None, "", 0, ep.url, ep.source_js, ep.templated, ep.via)
-                    for ep in scoped]
+            return ([Hit("-", None, "", 0, ep.url, ep.source_js, ep.templated, ep.via)
+                     for ep in scoped]
+                    + [Hit("-", None, "", 0, root, g["source"], False, g["via"])
+                       for (kind, root), g in cloud_roots.items()])
+
+        cloud_hits: List[Hit] = []
+        if cloud_roots:
+            cloud_hits = await run_cloud_checks(session, cloud_roots, args)
 
         # 5. probe (templated paths skipped unless --probe-templated)
         to_probe = [ep for ep in scoped if not (args.skip_templated and ep.templated)]
         if len(to_probe) < len(scoped):
             log.info("Skipped %d templated path(s) (--skip-templated)", len(scoped) - len(to_probe))
         if not to_probe:
-            return []
+            return cloud_hits
 
         plan = [(ep, m) for ep in to_probe for m in args.methods]
         log.info("Probing %d request(s) with methods %s", len(plan), ",".join(args.methods))
@@ -644,7 +865,7 @@ async def process_target(target: str, js_urls: List[str], args: argparse.Namespa
                                    target_host, scope_enforced)
 
         results = await asyncio.gather(*(check(ep, m) for ep, m in plan))
-        return [h for h in results if h]
+        return [h for h in results if h] + cloud_hits
 
 
 # ── Output ────────────────────────────────────────────────────────────────────
@@ -818,6 +1039,13 @@ def parse_args() -> argparse.Namespace:
     email.add_argument("--email-recipient", metavar="EMAIL", help="Recipient address")
     email.add_argument("--aws-region", default="eu-central-1",
                        help="AWS region for SES (default: eu-central-1)")
+
+    cloud = p.add_argument_group("cloud", "Firebase / S3 / GCS / Azure Blob checks (no auth sent)")
+    cloud.add_argument("--no-cloud", action="store_true",
+                       help="Do not extract or check cloud storage resources")
+    cloud.add_argument("--check-cloud-write", "-check-cloud-write", action="store_true", dest="check_cloud_write",
+                       help="Also test WRITE: PUT a unique probe object and DELETE it right after. "
+                            "Changes data on the target storage, use only where authorized")
 
     p.add_argument("-v", "--verbose", action="store_true", help="Debug output")
     p.add_argument("-q", "--quiet", action="store_true", help="Only warnings and errors")
