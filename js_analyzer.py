@@ -183,8 +183,10 @@ PATTERNS: list[tuple[str, str, str]] = [
      r'(?:access[_-]?token|fb[_-]?access[_-]?token|facebook[_-]?access[_-]?token|'
      r'page[_-]?access[_-]?token|graph[_-]?api[_-]?token)\s*[=:]\s*'
      r'["\'](EAA[A-Za-z0-9]{50,})["\']'),
+    # Okta SSWS-токен = "00" + 40 символов. Без контекста это совпадает с любым
+    # фрагментом base64-блоба в бандлах, поэтому требуем "SSWS " или "okta…=" рядом.
     (HIGH, "Cloud / Okta API Token",
-     r'(?<![A-Za-z0-9])00[A-Za-z0-9_-]{40}(?![A-Za-z0-9_-])'),
+     r'(?i)(?:SSWS\s+|okta[\w-]{0,25}["\']?\s*[:=]\s*["\']?)(00[A-Za-z0-9_-]{40})(?![A-Za-z0-9_+/=-])'),
     (HIGH, "Cloud / HashiCorp Vault Token",
      r'\bhvs\.[A-Za-z0-9]{90,100}\b'),
 
@@ -378,6 +380,9 @@ def is_trivial(value: str) -> bool:
     if re.match(r'^[a-z_]+$', v): return True
 
     # ── Minified JS false-positive filters ───────────────────────────────────
+    # Только цифры (error/status-коды вроде 80041012, ID) — не секрет.
+    # Цена: цифровые PIN длиной ≥ 6 тоже отфильтруются.
+    if re.fullmatch(r'\d{6,}', v): return True
     # JS punctuation that cannot appear in a real credential
     if re.search(r'[(){}\[\];!?]', v): return True
     # Запятая и двоеточие по краю — признак минифицированного фрагмента кода
