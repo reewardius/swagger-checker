@@ -16,7 +16,10 @@ SecurityTrails):
   2. merge   → объединяет оригинальные URL + JS-ссылки (дедупликация)
                сохраняет объединённый список в <input>_scan_targets.txt
   3. scan    → сканирует все URL на секреты / sensitive patterns
-  4. excel   → генерирует отчёт findings.xlsx
+               + для каждого JS ищет sourceMappingURL= (или заголовок
+               SourceMap / X-SourceMap), скачивает .js.map и сканирует
+               sourcesContent (оригинальные исходники) теми же паттернами
+  4. excel   → генерирует отчёт findings.xlsx (+ лист "Source Maps")
   5. email   → отправляет отчёт через AWS SES
 
 Дополнительные опции:
@@ -32,6 +35,11 @@ SecurityTrails):
     --excel FILE          Путь к Excel-отчёту (default: findings.xlsx)
     --json FILE           Дополнительно сохранить JSON-отчёт
     --email-domains D1,D2 Искать email на указанных доменах (по умолчанию выключено)
+    --no-sourcemaps       Не искать / не сканировать .js.map файлы
+    --probe-maps          Пробовать <file>.js.map даже без sourceMappingURL в JS
+    --map-include-node-modules
+                          Сканировать и исходники из node_modules/ внутри .map
+                          (по умолчанию пропускаются — много FP из библиотек)
 
 Dependencies:
     pip install aiohttp tqdm openpyxl boto3 requests
@@ -51,7 +59,7 @@ import subprocess
 import tempfile
 import os
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin, unquote
 from dataclasses import dataclass, field
 from typing import Optional
 from tqdm import tqdm
@@ -406,6 +414,7 @@ class Finding:
     match: str
     line_number: int
     line_content: str
+    source: Optional[str] = None   # путь исходника внутри .js.map (sourcesContent)
 
 @dataclass
 class FileResult:
@@ -413,6 +422,9 @@ class FileResult:
     status: str          # ok | error | skip
     error: Optional[str] = None
     findings: list[Finding] = field(default_factory=list)
+    kind: str = "url"                    # url | sourcemap
+    parent: Optional[str] = None         # для sourcemap: JS, который на него ссылается
+    map_info: Optional[dict] = None      # для sourcemap: via / sources / with_content / ...
 
 # ─── Analysis ─────────────────────────────────────────────────────────────────
 
@@ -652,28 +664,236 @@ HEADERS = {
     "Accept-Encoding": "gzip, deflate",
 }
 
+# ─── Source maps (.js.map) ─────────────────────────────────────────────────────
+# Минифицированный бандл часто ссылается на карту исходников:
+#     //# sourceMappingURL=main.3f2a.js.map
+#     /*# sourceMappingURL=data:application/json;base64,... */   (inline)
+# или отдаёт её в HTTP-заголовке SourceMap / X-SourceMap.
+# В .map лежит поле sourcesContent — ПОЛНЫЕ оригинальные исходники (до
+# минификации/tree-shaking), где секреты, комментарии и .env-константы
+# видны гораздо чаще, чем в бандле. Каждый исходник сканируется отдельно
+# теми же паттернами, номер строки — строка в оригинальном файле.
+
+SOURCEMAPS_ENABLED       = True
+SOURCEMAP_PROBE          = False        # --probe-maps: пробовать <js>.map вслепую
+SOURCEMAP_SKIP_NODE_MODS = True         # --map-include-node-modules выключает
+SOURCEMAP_MAX_BYTES      = 50 * 1024 * 1024
+SOURCEMAP_TIMEOUT        = 60
+
+_SOURCEMAP_COMMENT_RE = re.compile(r'(?://|/\*)\s*[#@]\s*sourceMappingURL\s*=\s*(\S+)')
+_JS_PATH_RE           = re.compile(r'\.[cm]?js$', re.IGNORECASE)
+_MAP_PATH_RE          = re.compile(r'\.map$', re.IGNORECASE)
+
+def extract_sourcemap_ref(text: str) -> Optional[str]:
+    """Возвращает значение ПОСЛЕДНЕГО валидного sourceMappingURL= (по спецификации
+    действует последний). Отбрасывает ложные совпадения внутри строк рантайма
+    webpack/eval, вроде  "//# sourceMappingURL=" + url ."""
+    if "sourceMappingURL" not in text:
+        return None
+    ref = None
+    for m in _SOURCEMAP_COMMENT_RE.finditer(text):
+        cand = m.group(1)
+        if cand.endswith("*/"):
+            cand = cand[:-2]
+        cand = cand.strip()
+        if not cand or any(c in cand for c in '"\'`+()<>{}\\'):
+            continue
+        ref = cand
+    return ref
+
+def decode_data_uri(uri: str) -> Optional[str]:
+    try:
+        header, payload = uri[5:].split(",", 1)
+    except ValueError:
+        return None
+    if ";base64" in header.lower():
+        try:
+            payload = unquote(payload)
+            return base64.b64decode(payload + "=" * (-len(payload) % 4)).decode("utf-8", errors="replace")
+        except Exception:
+            return None
+    return unquote(payload)
+
+def parse_sourcemap(raw: str) -> Optional[dict]:
+    raw = raw.lstrip("﻿").lstrip()
+    # XSSI-префикс, разрешённый спецификацией source map
+    if raw.startswith(")]}'"):
+        raw = raw.split("\n", 1)[1] if "\n" in raw else raw[4:]
+    if not raw.startswith("{"):
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not any(k in data for k in ("mappings", "sources", "sections")):
+        return None
+    return data
+
+def iter_sourcemap_sources(data: dict, depth: int = 0):
+    """yield (source_path, content_or_None) — включая index maps ("sections")."""
+    if depth > 3:
+        return
+    for sec in data.get("sections") or []:
+        if isinstance(sec, dict) and isinstance(sec.get("map"), dict):
+            yield from iter_sourcemap_sources(sec["map"], depth + 1)
+    sources  = data.get("sources") or []
+    contents = data.get("sourcesContent") or []
+    if not isinstance(sources, list):  sources = []
+    if not isinstance(contents, list): contents = []
+    for i in range(max(len(sources), len(contents))):
+        name = sources[i] if i < len(sources) and isinstance(sources[i], str) else f"source[{i}]"
+        content = contents[i] if i < len(contents) and isinstance(contents[i], str) else None
+        yield name, content
+
+def analyze_sourcemap(data: dict, map_url: str, min_severity: str,
+                      inline: bool = False) -> tuple[list[Finding], dict]:
+    min_order = SEVERITY_ORDER[min_severity]
+    findings: list[Finding] = []
+    total = with_content = skipped = 0
+    for name, content in iter_sourcemap_sources(data):
+        total += 1
+        if not content:
+            continue
+        with_content += 1
+        if SOURCEMAP_SKIP_NODE_MODS and "node_modules/" in name.replace("\\", "/"):
+            skipped += 1
+            continue
+        for f in analyze_content(content, min_severity):
+            f.source = name[:300]
+            findings.append(f)
+
+    seen: set[tuple] = set()
+    unique: list[Finding] = []
+    for f in findings:
+        key = (f.category, f.match)
+        if key not in seen:
+            seen.add(key)
+            unique.append(f)
+    unique.sort(key=lambda f: (SEVERITY_ORDER[f.severity], f.source or "", f.line_number))
+
+    # Сам факт доступной карты в Findings НЕ репортится — только реальные
+    # секреты из sourcesContent. Статистика по картам — на листе "Source Maps".
+    info = {"sources": total, "with_content": with_content, "skipped_node_modules": skipped}
+    return unique, info
+
+async def _read_limited(resp: aiohttp.ClientResponse, limit: int) -> Optional[bytes]:
+    if resp.content_length is not None and resp.content_length > limit:
+        return None
+    buf = bytearray()
+    async for chunk in resp.content.iter_chunked(65536):
+        buf.extend(chunk)
+        if len(buf) > limit:
+            return None
+    return bytes(buf)
+
+async def fetch_sourcemap(
+    session: aiohttp.ClientSession,
+    js_url: str,
+    ref: str,
+    via: str,                 # comment | header | inline | probe | direct
+    min_severity: str,
+    map_seen: set,
+) -> Optional[FileResult]:
+    def err(map_url: str, msg: str) -> Optional[FileResult]:
+        # Вслепую пробованный .map, которого нет — не шумим в отчёте.
+        if via == "probe":
+            return None
+        return FileResult(url=map_url, status="error", error=msg, kind="sourcemap",
+                          parent=js_url, map_info={"via": via})
+
+    if ref.startswith("data:"):
+        map_url = f"{js_url} [inline sourcemap]"
+        raw = decode_data_uri(ref)
+        if raw is None:
+            return err(map_url, "Cannot decode inline data: URI")
+    else:
+        map_url = urljoin(js_url, ref)
+        if urlparse(map_url).scheme not in ("http", "https"):
+            return None
+        if map_url in map_seen:
+            return None
+        map_seen.add(map_url)
+        try:
+            async with session.get(map_url, headers=HEADERS,
+                                   timeout=aiohttp.ClientTimeout(total=SOURCEMAP_TIMEOUT)) as resp:
+                if resp.status != 200:
+                    return err(map_url, f"HTTP {resp.status}")
+                body = await _read_limited(resp, SOURCEMAP_MAX_BYTES)
+        except asyncio.TimeoutError:
+            return err(map_url, "Timeout")
+        except Exception as e:
+            return err(map_url, str(e))
+        if body is None:
+            return err(map_url, f"Too large (> {SOURCEMAP_MAX_BYTES // 1024 // 1024} MB)")
+        raw = body.decode("utf-8", errors="replace")
+
+    data = parse_sourcemap(raw)
+    if data is None:
+        return err(map_url, "Not a valid source map (JSON)")
+
+    # Карты бывают на десятки МБ — анализ в отдельном потоке, чтобы не
+    # блокировать event loop остальных загрузок.
+    findings, info = await asyncio.to_thread(
+        analyze_sourcemap, data, map_url, min_severity, ref.startswith("data:")
+    )
+    info["via"] = via
+    return FileResult(url=map_url, status="ok", findings=findings,
+                      kind="sourcemap", parent=js_url, map_info=info)
+
 async def fetch_and_analyze(
     session: aiohttp.ClientSession,
     url: str,
     min_severity: str,
-) -> FileResult:
+    map_seen: Optional[set] = None,
+) -> list[FileResult]:
     url = url.strip()
     if not url or url.startswith("#"):
-        return FileResult(url=url, status="skip")
+        return [FileResult(url=url, status="skip")]
     if not urlparse(url).scheme:
         url = "https://" + url
+
+    # URL сам по себе .map (например, getJS/пользователь дал его напрямую)
+    if SOURCEMAPS_ENABLED and map_seen is not None and _MAP_PATH_RE.search(urlparse(url).path):
+        r = await fetch_sourcemap(session, url, url, "direct", min_severity, map_seen)
+        return [r] if r else [FileResult(url=url, status="skip")]
+
     try:
         async with session.get(url, headers=HEADERS,
                                timeout=aiohttp.ClientTimeout(total=20)) as resp:
             if resp.status != 200:
-                return FileResult(url=url, status="error", error=f"HTTP {resp.status}")
+                return [FileResult(url=url, status="error", error=f"HTTP {resp.status}")]
             text = await resp.text(errors="replace")
+            final_url  = str(resp.url)
+            header_ref = resp.headers.get("SourceMap") or resp.headers.get("X-SourceMap")
         findings = analyze_content(text, min_severity)
-        return FileResult(url=url, status="ok", findings=findings)
+        results = [FileResult(url=url, status="ok", findings=findings)]
     except asyncio.TimeoutError:
-        return FileResult(url=url, status="error", error="Timeout")
+        return [FileResult(url=url, status="error", error="Timeout")]
     except Exception as e:
-        return FileResult(url=url, status="error", error=str(e))
+        return [FileResult(url=url, status="error", error=str(e))]
+
+    if SOURCEMAPS_ENABLED and map_seen is not None:
+        ref, via = None, None
+        if header_ref and header_ref.strip():
+            ref, via = header_ref.strip(), "header"
+        else:
+            ref = extract_sourcemap_ref(text)
+            if ref:
+                via = "inline" if ref.startswith("data:") else "comment"
+        if not ref and SOURCEMAP_PROBE and _JS_PATH_RE.search(urlparse(final_url).path):
+            ref = urlparse(final_url)._replace(query="", fragment="").geturl() + ".map"
+            via = "probe"
+        if ref:
+            try:
+                mr = await fetch_sourcemap(session, final_url, ref, via, min_severity, map_seen)
+            except Exception as e:
+                mr = FileResult(url=urljoin(final_url, ref), status="error", error=str(e),
+                                kind="sourcemap", parent=final_url, map_info={"via": via})
+            if mr:
+                results.append(mr)
+    return results
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 1 — SecurityTrails: root domains → subdomains
@@ -857,38 +1077,59 @@ async def step_scan(urls: list[str], concurrency: int, severity: str) -> list[Fi
     print(f"  Threads : {concurrency}")
     print(f"  Min sev : {severity}")
     print(f"  Patterns: {len(PATTERNS) + len(EXTRA_PATTERNS)}"
-          f"{f' (+ email: {len(EMAIL_DOMAINS)} domain(s) — ' + ', '.join(EMAIL_DOMAINS) + ')' if EMAIL_DOMAINS else ''}\n")
+          f"{f' (+ email: {len(EMAIL_DOMAINS)} domain(s) — ' + ', '.join(EMAIL_DOMAINS) + ')' if EMAIL_DOMAINS else ''}")
+    print(f"  Source maps: {'disabled' if not SOURCEMAPS_ENABLED else 'enabled'}"
+          f"{' (+ probe <js>.map)' if SOURCEMAPS_ENABLED and SOURCEMAP_PROBE else ''}"
+          f"{' (incl. node_modules)' if SOURCEMAPS_ENABLED and not SOURCEMAP_SKIP_NODE_MODS else ''}\n")
 
     sem = asyncio.Semaphore(concurrency)
     connector = aiohttp.TCPConnector(ssl=False, limit=concurrency)
+    map_seen: set[str] = set()
+
+    def print_result(r: FileResult, url: str, pbar: tqdm):
+        if r.kind == "sourcemap":
+            if r.status == "ok":
+                mi = r.map_info or {}
+                tqdm.write(f"  🗺  {GREEN}Source map ({mi.get('via')}){RESET}: {r.url}"
+                           f"  {DIM}[sources: {mi.get('sources')}, with content: "
+                           f"{mi.get('with_content')}] ← {r.parent}{RESET}")
+            elif r.status == "error":
+                tqdm.write(f"  🗺  {DIM}Source map referenced but unavailable: {r.url} "
+                           f"({r.error}) ← {r.parent}{RESET}")
+        if not r.findings:
+            return
+        lines = [
+            f"\n{'═'*72}",
+            f"  {BOLD}{r.url}{RESET}",
+        ]
+        if r.kind == "sourcemap":
+            lines.append(f"  {DIM}↳ source map of {r.parent}{RESET}")
+        lines.append(f"  {SEVERITY_COLOR[CRITICAL]}{BOLD}⚠  {len(r.findings)} finding(s){RESET}")
+        grouped: dict[str, list[Finding]] = {}
+        for f in r.findings:
+            grouped.setdefault(f.category, []).append(f)
+        for category, items in grouped.items():
+            sev  = items[0].severity
+            col  = SEVERITY_COLOR[sev]
+            icon = SEVERITY_ICON[sev]
+            lines.append(f"\n  {col}{BOLD}{icon} [{sev}] {category}{RESET}")
+            for item in items:
+                loc = f"{item.source} : line {item.line_number}" if item.source else f"line {item.line_number}"
+                lines.append(f"    {DIM}{loc}{RESET}")
+                lines.append(f"      Value   : {col}{BOLD}{item.match}{RESET}")
+                lines.append(f"      Context : {DIM}{item.line_content}{RESET}")
+        tqdm.write("\n".join(lines))
+        pbar.set_postfix_str(
+            f"last hit: {r.url.split('/')[-1][:30]} ({len(r.findings)})"
+        )
 
     async def guarded_fetch(session: aiohttp.ClientSession, url: str, pbar: tqdm):
         async with sem:
-            r = await fetch_and_analyze(session, url, severity)
-            if r.findings:
-                lines = [
-                    f"\n{'═'*72}",
-                    f"  {BOLD}{r.url}{RESET}",
-                    f"  {SEVERITY_COLOR[CRITICAL]}{BOLD}⚠  {len(r.findings)} finding(s){RESET}",
-                ]
-                grouped: dict[str, list[Finding]] = {}
-                for f in r.findings:
-                    grouped.setdefault(f.category, []).append(f)
-                for category, items in grouped.items():
-                    sev  = items[0].severity
-                    col  = SEVERITY_COLOR[sev]
-                    icon = SEVERITY_ICON[sev]
-                    lines.append(f"\n  {col}{BOLD}{icon} [{sev}] {category}{RESET}")
-                    for item in items:
-                        lines.append(f"    {DIM}line {item.line_number}{RESET}")
-                        lines.append(f"      Value   : {col}{BOLD}{item.match}{RESET}")
-                        lines.append(f"      Context : {DIM}{item.line_content}{RESET}")
-                tqdm.write("\n".join(lines))
-                pbar.set_postfix_str(
-                    f"last hit: {url.split('/')[-1][:30]} ({len(r.findings)})"
-                )
+            rs = await fetch_and_analyze(session, url, severity, map_seen)
+            for r in rs:
+                print_result(r, url, pbar)
             pbar.update(1)
-            return r
+            return rs
 
     async with aiohttp.ClientSession(connector=connector) as session:
         with tqdm(
@@ -897,9 +1138,9 @@ async def step_scan(urls: list[str], concurrency: int, severity: str) -> list[Fi
             colour="cyan",
         ) as pbar:
             tasks = [guarded_fetch(session, u, pbar) for u in urls]
-            results = await asyncio.gather(*tasks)
+            nested = await asyncio.gather(*tasks)
 
-    return list(results)
+    return [r for rs in nested for r in rs]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 5 — Excel report
@@ -952,6 +1193,7 @@ def step_excel(results: list[FileResult], path: str) -> bool:
         ("Severity", 11),
         ("Category", 40),
         ("Value",    62),
+        ("Source file (js.map)", 40),
         ("Line",      6),
     ]
     for ci, (hdr, w) in enumerate(col_cfg, 1):
@@ -966,7 +1208,7 @@ def step_excel(results: list[FileResult], path: str) -> bool:
 
     # Deduplicate by (url, value): if same value appears in multiple patterns,
     # keep only the one with the highest severity.
-    seen: dict[tuple, tuple] = {}  # (url, value) -> (sev, cat, line)
+    seen: dict[tuple, tuple] = {}  # (url, value) -> (sev, cat, line, source)
     for res in sorted(results, key=lambda r: r.url):
         if res.status != "ok" or not res.findings:
             continue
@@ -974,23 +1216,23 @@ def step_excel(results: list[FileResult], path: str) -> bool:
             key = (res.url, f.match)
             existing = seen.get(key)
             if existing is None or SEVERITY_ORDER[f.severity] < SEVERITY_ORDER[existing[0]]:
-                seen[key] = (f.severity, f.category, f.line_number)
+                seen[key] = (f.severity, f.category, f.line_number, f.source or "")
 
     # Sort: url asc, then severity asc (CRITICAL first)
     deduped = sorted(
-        [(url, val, sev, cat, line) for (url, val), (sev, cat, line) in seen.items()],
+        [(url, val, sev, cat, line, src) for (url, val), (sev, cat, line, src) in seen.items()],
         key=lambda x: (x[0], SEVERITY_ORDER[x[2]])
     )
 
     data_row = 2
-    for url, val, sev, cat, line in deduped:
+    for url, val, sev, cat, line, src in deduped:
         fill_hex = FILL.get(sev, "FFFFFF")
-        for ci, value in enumerate([url, sev, cat, val, line], 1):
+        for ci, value in enumerate([url, sev, cat, val, src, line], 1):
             cell = ws.cell(row=data_row, column=ci, value=value)
             cell.font      = F_DATA
             cell.fill      = PatternFill("solid", fgColor=fill_hex)
             cell.border    = BORDER
-            cell.alignment = CENTER if ci in (2, 5) else WRAP
+            cell.alignment = CENTER if ci in (2, 6) else WRAP
         data_row += 1
 
     if data_row > 2:
@@ -1005,7 +1247,7 @@ def step_excel(results: list[FileResult], path: str) -> bool:
     # Count from deduplicated rows so Summary matches Findings sheet
     sev_counts: dict[str, int] = {CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0}
     sev_urls:   dict[str, set] = {CRITICAL: set(), HIGH: set(), MEDIUM: set(), LOW: set()}
-    for url, val, sev, cat, line in deduped:
+    for url, val, sev, cat, line, src in deduped:
         sev_counts[sev] += 1
         sev_urls[sev].add(url)
 
@@ -1021,6 +1263,9 @@ def step_excel(results: list[FileResult], path: str) -> bool:
         ("Clean (no findings)",count_clean),
         ("URLs with findings", total_urls_hit),
         ("Fetch errors",       count_errors),
+        ("Source maps exposed", sum(1 for r in results if r.kind == "sourcemap" and r.status == "ok")),
+        ("Source maps referenced, unavailable",
+                               sum(1 for r in results if r.kind == "sourcemap" and r.status == "error")),
     ]
     for i, (lbl, val) in enumerate(meta, 1):
         lc = ws2.cell(row=i, column=1, value=lbl)
@@ -1055,6 +1300,39 @@ def step_excel(results: list[FileResult], path: str) -> bool:
         cell.fill      = PatternFill("solid", fgColor=FILL_TOTAL)
         cell.alignment = CENTER
         cell.border    = BORDER
+
+    # ── Sheet 3: Source Maps ──────────────────────────────────────────────────
+    maps = [r for r in results if r.kind == "sourcemap"]
+    ws3 = wb.create_sheet("Source Maps")
+    map_cols = [
+        ("JS URL", 58), ("Map URL", 58), ("Found via", 11), ("Status", 18),
+        ("Sources", 9), ("With sourcesContent", 12), ("Skipped node_modules", 12),
+        ("Secret findings", 10),
+    ]
+    for ci, (hdr, w) in enumerate(map_cols, 1):
+        cell = ws3.cell(row=1, column=ci, value=hdr)
+        cell.font      = F_HDR
+        cell.fill      = PatternFill("solid", fgColor=FILL_HDR)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border    = BORDER
+        ws3.column_dimensions[get_column_letter(ci)].width = w
+    ws3.freeze_panes = "A2"
+    for ri, r in enumerate(sorted(maps, key=lambda r: (r.status != "ok", r.parent or "")), 2):
+        mi = r.map_info or {}
+        secrets = sum(1 for f in r.findings if not f.category.startswith("Source Map / "))
+        row = [r.parent, r.url, mi.get("via", ""),
+               "accessible" if r.status == "ok" else (r.error or r.status),
+               mi.get("sources", ""), mi.get("with_content", ""),
+               mi.get("skipped_node_modules", ""), secrets if r.status == "ok" else ""]
+        fill_hex = (FILL[CRITICAL] if secrets else FILL[MEDIUM]) if r.status == "ok" else "EEEEEE"
+        for ci, value in enumerate(row, 1):
+            cell = ws3.cell(row=ri, column=ci, value=value)
+            cell.font      = F_DATA
+            cell.fill      = PatternFill("solid", fgColor=fill_hex)
+            cell.border    = BORDER
+            cell.alignment = WRAP if ci <= 2 else CENTER
+    if maps:
+        ws3.auto_filter.ref = f"A1:{get_column_letter(len(map_cols))}{len(maps) + 1}"
 
     wb.save(path)
     print(f"  {GREEN}✓  Excel saved → {path}{RESET}")
@@ -1101,7 +1379,8 @@ def step_email(results: list[FileResult], excel_path: Optional[str] = None, json
         f"Summary\n\n"
         f"  Files scanned     : {len(results)}\n"
         f"  \u2713 Clean           : {len(clean)}\n"
-        f"  \u26a0 With findings  : {len(hits)}  ({total_f} total)\n\n"
+        f"  \u26a0 With findings  : {len(hits)}  ({total_f} total)\n"
+        f"  Source maps (.map): {sum(1 for r in results if r.kind == 'sourcemap' and r.status == 'ok')} exposed\n\n"
         f"Full details are in the attached Excel file (findings.xlsx)."
     )
 
@@ -1162,9 +1441,11 @@ def save_json(results: list[FileResult], path: str):
             continue
         out.append({
             "url": r.url, "status": r.status, "error": r.error,
+            "kind": r.kind, "parent": r.parent, "map_info": r.map_info,
             "findings": [
                 {"severity": f.severity, "category": f.category,
-                 "match": f.match, "line": f.line_number, "context": f.line_content}
+                 "match": f.match, "line": f.line_number, "context": f.line_content,
+                 "source": f.source}
                 for f in r.findings
             ],
         })
@@ -1222,6 +1503,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Опционально: искать email-адреса на указанных доменах "
                              "(через запятую, напр. temabit.com,foodtech.team). "
                              "По умолчанию поиск email отключён.")
+    scan_p.add_argument("--no-sourcemaps", action="store_true",
+                        help="Не искать sourceMappingURL и не сканировать .js.map файлы")
+    scan_p.add_argument("--probe-maps", action="store_true",
+                        help="Пробовать <file>.js.map даже если в JS нет sourceMappingURL "
+                             "(больше запросов, находит 'забытые' карты)")
+    scan_p.add_argument("--map-include-node-modules", action="store_true",
+                        help="Сканировать и исходники из node_modules/ внутри .map "
+                             "(по умолчанию пропускаются — много ложных срабатываний)")
 
     return parser
 
@@ -1233,6 +1522,11 @@ async def main():
         EXTRA_PATTERNS.extend(build_email_patterns(domains))
         EMAIL_DOMAINS.extend(d.strip().lstrip("@") for d in domains)
         print(f"  [i] Email search enabled for domains: {', '.join(domains)}")
+
+    global SOURCEMAPS_ENABLED, SOURCEMAP_PROBE, SOURCEMAP_SKIP_NODE_MODS
+    SOURCEMAPS_ENABLED       = not args.no_sourcemaps
+    SOURCEMAP_PROBE          = args.probe_maps
+    SOURCEMAP_SKIP_NODE_MODS = not args.map_include_node_modules
 
     precompile_patterns()  # один раз, до начала конкурентного сканирования
 
@@ -1308,6 +1602,10 @@ async def main():
     print(f"  {GREEN}✓ Clean          : {count_clean}{RESET}")
     print(f"  {SEVERITY_COLOR[CRITICAL]}⚠ With findings : {count_hits}  ({total_findings} total){RESET}")
     print(f"  {DIM}✗ Fetch errors   : {count_errors}{RESET}")
+    count_maps = sum(1 for r in results if r.kind == "sourcemap" and r.status == "ok")
+    count_maps_bad = sum(1 for r in results if r.kind == "sourcemap" and r.status == "error")
+    print(f"  🗺  Source maps    : {count_maps} exposed"
+          f"{f', {count_maps_bad} referenced but unavailable' if count_maps_bad else ''}")
 
     # ── Step 5: Excel ─────────────────────────────────────────────────────────
     excel_ok = step_excel(results, args.excel)
